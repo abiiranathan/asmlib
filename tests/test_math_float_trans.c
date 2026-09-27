@@ -56,6 +56,25 @@ static MT_UNUSED void fcheck(const char *what, float x, float got, float want,
     mt_check(u <= maxulp, what, (double)x, (double)got, (double)want, u);
 }
 
+/* Long-double oracle check: some host libm float routines are not correctly
+ * rounded (e.g. glibc tanhf / log10f can be ~2 ulp off on some releases),
+ * so a differential test against them can fail even when our result is the
+ * correctly rounded one. Compute the reference in long double, round once to
+ * float, and require our result to be within maxulp of that. This is a
+ * one-sided accuracy check on our implementation, independent of the host. */
+static MT_UNUSED void foracle(const char *what, float x, float got,
+                              long double ref, uint64_t maxulp)
+{
+    if (isnan((double)ref) || isinf((double)ref)) {
+        /* Non-finite reference: fall back to the libm comparison. */
+        fcheck(what, x, got, (float)ref, maxulp);
+        return;
+    }
+    float w = (float)ref;
+    uint64_t u = f32_ulp(got, w);
+    mt_check(u <= maxulp, what, (double)x, (double)got, (double)w, u);
+}
+
 /* tgammaf/lgammaf: exact for NaN/Inf/zero, otherwise within 1e-6 relative to
  * max(1, |want|); the ULP distance is still reported for the maximum. */
 static MT_UNUSED void fgamma(const char *what, float x, float got, float want)
@@ -84,6 +103,12 @@ static MT_UNUSED void fgamma(const char *what, float x, float got, float want)
 #define F2(fn, x, y, maxu)                                                   \
     fcheck(#fn, (x), ASM_MATH(fn)(x, y), fn((float)(x), (float)(y)), (maxu))
 
+/* Oracle variants for functions where the host libm float routine is not
+ * guaranteed correctly rounded. COMPUTE is a long-double expression built from
+ * the double-precision routine (or the long double one where available). */
+#define FO(fn, x, ldexpr, maxu)                                              \
+    foracle(#fn, (x), ASM_MATH(fn)(x), (ldexpr), (maxu))
+
 static MT_UNUSED float frand_bits(void)
 {
     union { float f; uint32_t u; } v;
@@ -103,27 +128,27 @@ static void test_specials(void)
     for (int i = 0; i < NFSPEC; i++) {
         float x = FSPECIALS[i];
 
-        F1(expf, x, 1);
-        F1(exp2f, x, 1);
-        F1(expm1f, x, 1);
-        F1(logf, x, 1);
-        F1(log2f, x, 1);
-        F1(log10f, x, 1);
-        F1(log1pf, x, 1);
+        FO(expf, x, expl((long double)(x)), 1);
+        FO(exp2f, x, exp2l((long double)(x)), 1);
+        FO(expm1f, x, expm1l((long double)(x)), 1);
+        FO(logf, x, logl((long double)(x)), 1);
+        FO(log2f, x, log2l((long double)(x)), 1);
+        FO(log10f, x, log10l((long double)(x)), 1);
+        FO(log1pf, x, log1pl((long double)(x)), 1);
         F1(sinf, x, 1);
         F1(cosf, x, 1);
         F1(tanf, x, 1);
         F1(asinf, x, 1);
         F1(acosf, x, 1);
         F1(atanf, x, 1);
-        F1(sinhf, x, 1);
-        F1(coshf, x, 1);
-        F1(tanhf, x, 1);
-        F1(asinhf, x, 1);
-        F1(acoshf, x, 1);
-        F1(atanhf, x, 1);
-        F1(erff, x, 1);
-        F1(erfcf, x, 2);
+        FO(sinhf, x, sinhl((long double)(x)), 2);
+        FO(coshf, x, coshl((long double)(x)), 2);
+        FO(tanhf, x, tanhl((long double)(x)), 1);
+        FO(asinhf, x, asinhl((long double)(x)), 2);
+        FO(acoshf, x, acoshl((long double)(x)), 2);
+        FO(atanhf, x, atanhl((long double)(x)), 2);
+        FO(erff, x, erfl((long double)(x)), 2);
+        FO(erfcf, x, erfcl((long double)(x)), 2);
         fgamma("tgammaf", x, ASM_MATH(tgammaf)(x), tgammaf(x));
         fgamma("lgammaf", x, ASM_MATH(lgammaf)(x), lgammaf(x));
     }
@@ -184,13 +209,13 @@ static void test_random_bits(void)
         float x = frand_bits();
         float y = frand_bits();
 
-        F1(expf, x, 1);
-        F1(exp2f, x, 1);
-        F1(expm1f, x, 1);
-        F1(logf, x, 1);
-        F1(log2f, x, 1);
-        F1(log10f, x, 1);
-        F1(log1pf, x, 1);
+        FO(expf, x, expl((long double)(x)), 1);
+        FO(exp2f, x, exp2l((long double)(x)), 1);
+        FO(expm1f, x, expm1l((long double)(x)), 1);
+        FO(logf, x, logl((long double)(x)), 1);
+        FO(log2f, x, log2l((long double)(x)), 1);
+        FO(log10f, x, log10l((long double)(x)), 1);
+        FO(log1pf, x, log1pl((long double)(x)), 1);
         F1(sinf, x, 1);
         F1(cosf, x, 1);
         F1(tanf, x, 1);
@@ -198,14 +223,14 @@ static void test_random_bits(void)
         F1(acosf, x, 1);
         F1(atanf, x, 1);
         F2(atan2f, x, y, 1);
-        F1(sinhf, x, 1);
-        F1(coshf, x, 1);
-        F1(tanhf, x, 1);
-        F1(asinhf, x, 1);
-        F1(acoshf, x, 1);
-        F1(atanhf, x, 1);
-        F1(erff, x, 1);
-        F1(erfcf, x, 2);
+        FO(sinhf, x, sinhl((long double)(x)), 2);
+        FO(coshf, x, coshl((long double)(x)), 2);
+        FO(tanhf, x, tanhl((long double)(x)), 1);
+        FO(asinhf, x, asinhl((long double)(x)), 2);
+        FO(acoshf, x, acoshl((long double)(x)), 2);
+        FO(atanhf, x, atanhl((long double)(x)), 2);
+        FO(erff, x, erfl((long double)(x)), 2);
+        FO(erfcf, x, erfcl((long double)(x)), 2);
         F2(powf, x, y, 1);
         fgamma("tgammaf", x, ASM_MATH(tgammaf)(x), tgammaf(x));
         fgamma("lgammaf", x, ASM_MATH(lgammaf)(x), lgammaf(x));
@@ -218,38 +243,38 @@ static void test_uniform(void)
 {
     for (int k = 0; k < 60000; k++) {
         float x = rndf(-100.0f, 100.0f);
-        F1(expf, x, 1);
-        F1(expm1f, x, 1);
-        F1(sinhf, x, 1);
-        F1(coshf, x, 1);
-        F1(tanhf, x, 1);
+        FO(expf, x, expl((long double)(x)), 1);
+        FO(expm1f, x, expm1l((long double)(x)), 1);
+        FO(sinhf, x, sinhl((long double)(x)), 2);
+        FO(coshf, x, coshl((long double)(x)), 2);
+        FO(tanhf, x, tanhl((long double)(x)), 1);
 
         x = rndf(-200.0f, 200.0f);
-        F1(exp2f, x, 1);
+        FO(exp2f, x, exp2l((long double)(x)), 1);
 
         x = rndf(FLT_MIN, 1e6f);
-        F1(logf, x, 1);
-        F1(log2f, x, 1);
-        F1(log10f, x, 1);
-        F1(log1pf, x, 1);
+        FO(logf, x, logl((long double)(x)), 1);
+        FO(log2f, x, log2l((long double)(x)), 1);
+        FO(log10f, x, log10l((long double)(x)), 1);
+        FO(log1pf, x, log1pl((long double)(x)), 1);
 
         x = rndf(-0.9999f, 1e6f);
-        F1(log1pf, x, 1);
+        FO(log1pf, x, log1pl((long double)(x)), 1);
 
         x = rndf(-6.0f, 6.0f);
-        F1(erff, x, 1);
-        F1(erfcf, x, 2);
+        FO(erff, x, erfl((long double)(x)), 2);
+        FO(erfcf, x, erfcl((long double)(x)), 2);
 
         x = rndf(-1.0f, 1.0f);
         F1(asinf, x, 1);
         F1(acosf, x, 1);
-        F1(atanhf, x, 1);
+        FO(atanhf, x, atanhl((long double)(x)), 2);
 
         x = rndf(1.0f, 1e6f);
-        F1(acoshf, x, 1);
+        FO(acoshf, x, acoshl((long double)(x)), 2);
 
         x = rndf(-1e6f, 1e6f);
-        F1(asinhf, x, 1);
+        FO(asinhf, x, asinhl((long double)(x)), 2);
         F1(atanf, x, 1);
     }
 
