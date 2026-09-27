@@ -31,10 +31,11 @@ examples/   a practical word-frequency analyser built on asmlib
   exist for.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
   `mmap`; 6–12x faster than glibc's allocator for burst workloads.
-* **Freestanding math library** for WebAssembly and bare-metal targets: 56
-  double-precision routines (`sin`, `log`, `pow`, `cbrt`, `erf`, …) in portable
-  C with no libc, no `libm`, no `errno` and no global state, differential-tested
-  against the host `libm` and broadly at glibc speed.
+* **Freestanding math library** for WebAssembly and bare-metal targets: 112
+  double- and single-precision routines (`sin`/`sinf`, `log`/`logf`,
+  `pow`/`powf`, `cbrt`, `erf`, …) in portable C with no libc, no `libm`, no
+  `errno` and no global state, differential-tested against the host `libm`
+  and broadly at glibc speed.
 * **Page-safe**: every speculative read is either in-bounds for the requested
   length or a naturally aligned vector load that cannot straddle a page.
   A dedicated guard-page test proves this by placing buffers against a
@@ -246,6 +247,12 @@ propagates, infinities and signed zero behave as `<math.h>` requires; no
 function sets `errno`). `rint` and `nearbyint` always round to nearest-even
 because the library never touches the floating-point environment — the only
 mode WebAssembly has.
+
+Every routine also has a **single-precision variant** (`asm_sinf`, `asm_expf`,
+`asm_powf`, `asm_atan2f`, …; the standard `sinf`/`expf`/… names under
+`ASMLIB_MATH_STD_NAMES`). The float routines promote to double and round once
+to float, which is faithful (≤1 ulp) and keeps one implementation of each
+algorithm; `fmaf` is a correctly-rounded port.
 
 The exponential, logarithmic, power, hyperbolic and `cbrt`/`hypot` kernels are
 fast table/polynomial implementations adapted from musl libc (MIT licensed; see

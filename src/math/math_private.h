@@ -81,4 +81,53 @@ static inline int f64_expfield(double x)
     return (int)((f64_bits(x) >> 52) & 0x7ff);
 }
 
+/* ---- binary32 helpers for the float variants ---------------------------- */
+typedef union {
+    float    f;
+    uint32_t u;
+} f32u;
+
+#define F32_SIGN 0x80000000u
+#define F32_EXP  0x7f800000u
+#define F32_MANT 0x007fffffu
+#define F32_ABS  0x7fffffffu
+
+#define F32_INF  f32_from_bits(F32_EXP)
+#define F32_QNAN f32_from_bits(F32_EXP | (1u << 22))
+
+static inline uint32_t f32_bits(float x)
+{
+    f32u v;
+    v.f = x;
+    return v.u;
+}
+
+static inline float f32_from_bits(uint32_t u)
+{
+    f32u v;
+    v.u = u;
+    return v.f;
+}
+
+static inline int f32_signbit(float x)
+{
+    return (int)(f32_bits(x) >> 31);
+}
+
+static inline int f32_isnan(float x)
+{
+    uint32_t u = f32_bits(x) & F32_ABS;
+    return u > F32_EXP;
+}
+
+static inline int f32_isinf(float x)
+{
+    return (f32_bits(x) & F32_ABS) == F32_EXP;
+}
+
+static inline int f32_iszero(float x)
+{
+    return (f32_bits(x) & F32_ABS) == 0;
+}
+
 #endif /* ASMLIB_MATH_PRIVATE_H */

@@ -121,6 +121,85 @@ double ASM_MATH(asinh)(double x);
 double ASM_MATH(acosh)(double x);
 double ASM_MATH(atanh)(double x);
 
+/*==============================================================================
+ * Single precision (float) variants
+ *------------------------------------------------------------------------------
+ * The same routine set for IEEE-754 binary32. Faithful (<= 1 ulp); most are
+ * evaluated in double and rounded once to float.
+ *============================================================================*/
+
+/* sign / select */
+float ASM_MATH(fabsf)(float x);
+float ASM_MATH(copysignf)(float x, float y);
+float ASM_MATH(fminf)(float x, float y);
+float ASM_MATH(fmaxf)(float x, float y);
+float ASM_MATH(fdimf)(float x, float y);
+float ASM_MATH(floorf)(float x);
+float ASM_MATH(ceilf)(float x);
+float ASM_MATH(truncf)(float x);
+float ASM_MATH(roundf)(float x);
+float ASM_MATH(rintf)(float x);
+float ASM_MATH(nearbyintf)(float x);
+
+/* decomposition / scaling */
+float ASM_MATH(ldexpf)(float x, int n);
+float ASM_MATH(scalbnf)(float x, int n);
+float ASM_MATH(frexpf)(float x, int *exp);
+float ASM_MATH(modff)(float x, float *iptr);
+int   ASM_MATH(ilogbf)(float x);
+float ASM_MATH(logbf)(float x);
+
+/* arithmetic */
+float ASM_MATH(fmodf)(float x, float y);
+float ASM_MATH(remainderf)(float x, float y);
+float ASM_MATH(remquof)(float x, float y, int *quo);
+float ASM_MATH(sqrtf)(float x);
+float ASM_MATH(cbrtf)(float x);
+float ASM_MATH(hypotf)(float x, float y);
+float ASM_MATH(nextafterf)(float x, float y);
+
+/* fma / integer rounding / nan */
+float ASM_MATH(fmaf)(float x, float y, float z);
+long      ASM_MATH(lrintf)(float x);
+long long ASM_MATH(llrintf)(float x);
+long      ASM_MATH(lroundf)(float x);
+long long ASM_MATH(llroundf)(float x);
+float     ASM_MATH(nanf)(const char *tag);
+
+/* exponential / log / pow */
+float ASM_MATH(expf)(float x);
+float ASM_MATH(exp2f)(float x);
+float ASM_MATH(expm1f)(float x);
+float ASM_MATH(logf)(float x);
+float ASM_MATH(log2f)(float x);
+float ASM_MATH(log10f)(float x);
+float ASM_MATH(log1pf)(float x);
+float ASM_MATH(powf)(float x, float y);
+
+/* trig / inverse */
+float ASM_MATH(sinf)(float x);
+float ASM_MATH(cosf)(float x);
+float ASM_MATH(tanf)(float x);
+void  ASM_MATH(sincosf)(float x, float *sinp, float *cosp);
+float ASM_MATH(asinf)(float x);
+float ASM_MATH(acosf)(float x);
+float ASM_MATH(atanf)(float x);
+float ASM_MATH(atan2f)(float y, float x);
+
+/* hyperbolic / inverse */
+float ASM_MATH(sinhf)(float x);
+float ASM_MATH(coshf)(float x);
+float ASM_MATH(tanhf)(float x);
+float ASM_MATH(asinhf)(float x);
+float ASM_MATH(acoshf)(float x);
+float ASM_MATH(atanhf)(float x);
+
+/* erf / gamma */
+float ASM_MATH(erff)(float x);
+float ASM_MATH(erfcf)(float x);
+float ASM_MATH(tgammaf)(float x);
+float ASM_MATH(lgammaf)(float x);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
