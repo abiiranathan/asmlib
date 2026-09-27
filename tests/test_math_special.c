@@ -32,6 +32,27 @@ static const double GAMMA_SPECIALS[] = {
 
 #define U1(fn, x, maxu) mt_cmp(#fn, (x), ASM_MATH(fn)(x), fn(x), (maxu))
 
+/* erf/erfc against a long-double oracle. The host libm erfc is *not* a safe
+ * reference: glibc's is ~0.5 ulp while musl's (which this library ports) is
+ * ~1.5 ulp, so a differential test can show a 3 ulp gap even though both are
+ * faithful. Compute the reference with erfcl/erfl (long double, ~64-bit
+ * mantissa - far more accurate than a double result needs) and require our
+ * double result to be within maxu ulp of it. */
+static MT_UNUSED void oracle_cmp(const char *what, double x, double got,
+                                 long double ref, uint64_t maxu)
+{
+    double want = (double)ref;
+
+    if (isnan((double)ref) || isnan(got)) {
+        mt_check(isnan((double)ref) && isnan(got), what, x, got, want, 0);
+        return;
+    }
+    mt_cmp(what, x, got, want, maxu);
+}
+
+#define O1(fn, x, ldexpr, maxu)                                              \
+    oracle_cmp(#fn, (x), ASM_MATH(fn)(x), (ldexpr), (maxu))
+
 /* Largest normalized relative error and largest meaningful ULP distance seen
  * by gamma_cmp. ULP distance is only tracked where |want| >= 1, since near
  * lgamma's zeros the ULP of the result is far below the algorithm's accuracy. */
@@ -147,29 +168,29 @@ static void test_erf(void)
     int i, k;
 
     for (i = 0; i < NERF; i++) {
-        U1(erf, ERF_SPECIALS[i], 1);
-        U1(erfc, ERF_SPECIALS[i], 2);
+        O1(erf, ERF_SPECIALS[i], erfl((long double)ERF_SPECIALS[i]), 1);
+        O1(erfc, ERF_SPECIALS[i], erfcl((long double)ERF_SPECIALS[i]), 2);
     }
 
     /* uniform [-6,6], the whole interesting range of erf */
     for (k = 0; k < 120000; k++) {
         double x = 12.0 * mt_rand_double() - 6.0;
-        U1(erf, x, 1);
-        U1(erfc, x, 2);
+        O1(erf, x, erfl((long double)(x)), 1);
+        O1(erfc, x, erfcl((long double)(x)), 2);
     }
     /* tiny arguments down to about 2^-100 */
     for (k = 0; k < 30000; k++) {
         int e = 20 + (int)(mt_rand64() % 80);
         double x = (2.0 * mt_rand_double() - 1.0) * ldexp(1.0, -e);
-        U1(erf, x, 1);
-        U1(erfc, x, 2);
+        O1(erf, x, erfl((long double)(x)), 1);
+        O1(erfc, x, erfcl((long double)(x)), 2);
     }
     /* large arguments, including the saturated tails */
     for (k = 0; k < 30000; k++) {
         int e = 4 + (int)(mt_rand64() % 996);
         double x = (2.0 * mt_rand_double() - 1.0) * ldexp(1.0, e);
-        U1(erf, x, 1);
-        U1(erfc, x, 2);
+        O1(erf, x, erfl((long double)(x)), 1);
+        O1(erfc, x, erfcl((long double)(x)), 2);
     }
 }
 
