@@ -1,0 +1,4 @@
+# Include path for the benchmark harnesses: asmlib.h lives in include/.
+CompileFlags:
+  Add:
+    - -I../include

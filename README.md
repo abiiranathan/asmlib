@@ -8,8 +8,9 @@ header plus static and shared libraries.
 
 ```
 src/        NASM sources (one module per area)
-include/    asmlib.h — the public C API
-tests/      differential + page-boundary + arena + malloc test suites
+src/math/   freestanding C math library (no libc; builds for wasm32)
+include/    asmlib.h — the public C API; asmlib_math.h — the math API
+tests/      differential + page-boundary + arena + malloc + math suites
 bench/      asmlib vs. libc micro-benchmarks, arena/malloc vs. malloc
 examples/   a practical word-frequency analyser built on asmlib
 ```
@@ -28,6 +29,10 @@ examples/   a practical word-frequency analyser built on asmlib
   exist for.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
   `mmap`; 6–12x faster than glibc's allocator for burst workloads.
+* **Freestanding math library** for WebAssembly and bare-metal targets: 44
+  double-precision routines (`sin`, `log`, `pow`, `cbrt`, …) in portable C
+  with no libc, no `libm`, no `errno` and no global state, faithful to
+  < 1 ulp and differential-tested against the host `libm`.
 * **Page-safe**: every speculative read is either in-bounds for the requested
   length or a naturally aligned vector load that cannot straddle a page.
   A dedicated guard-page test proves this by placing buffers against a
@@ -60,6 +65,8 @@ make bench      # run the string/memory benchmark vs. libc
 make bench-arena    # arena and asm_malloc vs. libc malloc (same binary)
 make bench-alloc    # alias for bench-arena
 make example    # run the word-frequency example
+make test-math  # run the freestanding double-precision math differential tests
+make wasm       # compile src/math/*.c for wasm32 and link build/asmlib_math.wasm
 make clean
 ```
 
@@ -191,6 +198,51 @@ buf = asm_realloc(buf, 1024);
 asm_free(buf);
 ```
 
+### Math (`src/math/`)
+
+A **freestanding, libc-free double-precision math library** designed to run in
+WebAssembly (and any freestanding target) as a drop-in `libm`. It is written in
+portable C11 with no external dependencies at all: no libc, no `libm`, no
+`errno`, no floating-point environment and no global state. It only needs the
+compiler and the FFI-free C runtime.
+
+By default every routine is `asm_`-prefixed so it can coexist with the host
+`libm` during differential testing. Compiling with `-DASMLIB_MATH_STD_NAMES`
+instead exposes the standard names, which is what `make wasm` does so the
+resulting module can be linked anywhere that expects `sin`, `log`, `pow`, ….
+
+| Group | Functions |
+|---|---|
+| Sign / select | `fabs`, `copysign`, `fmin`, `fmax`, `fdim` |
+| Rounding | `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` |
+| Decompose / scale | `frexp`, `modf`, `ldexp`, `scalbn`, `ilogb`, `logb` |
+| Arithmetic | `fmod`, `remainder`, `sqrt`, `cbrt`, `hypot` |
+| Exponential / log | `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `pow` |
+| Trig / inverse | `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2` |
+| Hyperbolic / inverse | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
+
+All routines take and return IEEE-754 binary64. Results are **faithful
+(< 1 ulp)** and special values follow IEEE-754 (NaN propagates, infinities and
+signed zero behave as `<math.h>` requires; no function sets `errno`). `rint`
+and `nearbyint` always round to nearest-even because the library never touches
+the floating-point environment — the only mode WebAssembly has.
+
+```c
+#include "asmlib_math.h"
+
+double r = asm_hypot(3.0, 4.0);        /* 5.0 */
+double y = asm_pow(2.0, 10.0);         /* 1024.0 */
+double s, c; asm_sincos(0.5, &s, &c);  /* one shared reduction */
+```
+
+`make test-math` builds each family and compares it against the host `libm`
+over special values and millions of randomised inputs, reporting the worst ULP
+difference. `cbrt` is verified directly (cube the result in `long double`)
+because glibc's own `cbrt` is up to 3 ulp off, while this one is correctly
+rounded. `make wasm` compiles the whole library to `wasm32` and links
+`build/asmlib_math.wasm`; the module has **no imports** and exports the
+standard `<math.h>` names, so it drops into any WebAssembly host.
+
 ## Design notes
 
 * **ABI.** All routines follow the System V AMD64 ABI. The leaf routines use
@@ -287,6 +339,13 @@ re-verified so any overlap or corruption is caught).
 zeroing, `realloc` in place and across the small/large boundary, and a
 200,000-operation randomised alloc/free/realloc stress test with content
 tagging.
+
+`make test-math` runs one differential binary per math family
+(`tests/test_math_*.c`). Each compares the implementation against the host
+`libm` over a table of IEEE-754 special values and up to a million randomised
+inputs, failing if the worst-case ULP difference exceeds 1. `cbrt` is checked
+by cubing the result in `long double` instead of against glibc, whose `cbrt`
+is itself up to 3 ulp off (this library is correctly rounded).
 
 Three helper targets exercise the same suites under dynamic analysis:
 
@@ -385,6 +444,12 @@ code is `src/sys.asm` (Linux x86-64 `mmap`/`munmap`); on bare metal or another
 OS, pass your own `alloc`/`free` to `asm_arena_init_grow` and skip
 `asm_arena_init_mmap` and `asm_malloc`. The test/benchmark harnesses use libc,
 but the library itself does not.
+
+The math library (`src/math/`) is freestanding by construction: it calls no
+libc or `libm`, sets no `errno`, uses no floating-point environment and keeps
+no global state, so a `wasm32` build (or any freestanding target) links with
+nothing. `make wasm` compiles every math source to a `wasm32` object with only
+the linker-provided `__stack_pointer` undefined.
 
 ## Porting to AArch64
 

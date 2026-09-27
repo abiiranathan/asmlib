@@ -21,6 +21,15 @@ INC       := src/common.inc
 STATIC    := $(BUILD)/libasmlib.a
 SHARED    := $(BUILD)/libasmlib.so
 
+# ---- freestanding math library (C, no libc/libm) ----------------------------
+MATH_SRC    := $(wildcard src/math/*.c)
+MATH_OBJ    := $(patsubst src/math/%.c,$(BUILD)/math/%.o,$(MATH_SRC))
+MATH_CFLAGS := -O2 -std=c11 -ffreestanding -fno-builtin -ffp-contract=off -fno-stack-protector \
+               -fno-math-errno -Wall -Wextra -Iinclude -Isrc/math
+MATH_TEST_SRC := $(wildcard tests/test_math_*.c)
+MATH_TEST_BIN := $(patsubst tests/%.c,$(BUILD)/%,$(MATH_TEST_SRC))
+WASM_CC     ?= clang --target=wasm32-unknown-unknown
+
 TEST_BIN      := $(BUILD)/test_asmlib
 TEST_ARENA_BIN:= $(BUILD)/test_arena
 TEST_ALLOC_BIN:= $(BUILD)/test_alloc
@@ -29,7 +38,7 @@ BENCH_ARENA_BIN := $(BUILD)/bench_arena
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan bench bench-arena bench-alloc perfbench example clean
+.PHONY: all test test-valgrind test-asan test-math bench bench-arena bench-alloc perfbench example clean wasm
 
 all: $(STATIC) $(SHARED)
 
@@ -114,6 +123,34 @@ $(EX_BIN): examples/example.c $(STATIC) $(HEADER)
 
 example: $(EX_BIN)
 	./$(EX_BIN)
+
+# ---- freestanding math library ----------------------------------------------
+$(BUILD)/math/%.o: src/math/%.c include/asmlib_math.h src/math/math_private.h | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) $(MATH_CFLAGS) -c -o $@ $<
+
+$(BUILD)/test_math_%: tests/test_math_%.c tests/math_test.h $(MATH_OBJ) include/asmlib_math.h | $(BUILD)
+	$(CC) $(MATH_CFLAGS) -o $@ $< $(MATH_OBJ) -lm
+
+test-math: $(MATH_TEST_BIN)
+	@for t in $(MATH_TEST_BIN); do ./$$t || exit 1; done
+
+# Compile every math source for wasm32 (freestanding). The objects are always
+# built; the wasm module is linked when wasm-ld is available. Defining
+# ASMLIB_MATH_STD_NAMES makes the module export standard <math.h> symbols.
+wasm:
+	@mkdir -p $(BUILD)/wasm
+	@for f in $(MATH_SRC); do \
+		o=$(BUILD)/wasm/$$(basename $$f .c).o; \
+		$(WASM_CC) $(MATH_CFLAGS) -DASMLIB_MATH_STD_NAMES -c -o $$o $$f || exit 1; \
+	done
+	@echo "wasm objects built in $(BUILD)/wasm"
+	@if command -v wasm-ld >/dev/null 2>&1; then \
+		wasm-ld --no-entry --export-all -o $(BUILD)/asmlib_math.wasm $(BUILD)/wasm/*.o; \
+		echo "linked $(BUILD)/asmlib_math.wasm"; \
+	else \
+		echo "wasm-ld not installed: objects compiled, module not linked"; \
+	fi
 
 clean:
 	rm -rf $(BUILD)

@@ -1,0 +1,7 @@
+# Include paths for the math library. clangd's generic fallback runs with the
+# source file's directory as its working directory, so these are relative to
+# src/math. -I../../include provides asmlib_math.h; -I.. provides src/.
+CompileFlags:
+  Add:
+    - -I../../include
+    - -I..

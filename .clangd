@@ -1,0 +1,22 @@
+# clangd configuration (used by the VSCode clangd extension).
+#
+# There is no compile_commands.json, so clangd synthesises a command whose
+# working directory is the directory of the source file. Relative include
+# paths therefore live next to the sources, in per-directory .clangd files:
+#
+#   src/math/.clangd   math library sources   -> ../../include, ..
+#   tests/.clangd      test harnesses         -> ../include, ../src, ../src/math
+#   examples/.clangd   example program        -> ../include
+#   bench/.clangd      benchmark harnesses    -> ../include
+#
+# This file only pins the language standard and matches the Makefile's warning
+# level. The customised clangd installed here adds -Werror and -Werror=conversion
+# (which also enables -Wconversion) to its fallback command; both are removed so
+# editor diagnostics stay advisories and do not duplicate the real build, which
+# uses only -Wall -Wextra.
+CompileFlags:
+  Add:
+    - -std=c11
+  Remove:
+    - -Werror
+    - -Werror=conversion

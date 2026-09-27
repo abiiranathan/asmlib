@@ -1,0 +1,4 @@
+# Include path for the example program: asmlib.h lives in include/.
+CompileFlags:
+  Add:
+    - -I../include
