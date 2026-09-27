@@ -134,9 +134,13 @@ example: $(EX_BIN)
 	./$(EX_BIN)
 
 # ---- freestanding math library ----------------------------------------------
+# The asm library requires AVX2, which in practice always implies FMA; enabling
+# it lets the musl-derived kernels use FMA (guarded by __FP_FAST_FMA) and keeps
+# them freestanding. -ffp-contract=off is kept so the exact double-double and
+# error-free transforms elsewhere in the library are not contracted.
 $(BUILD)/math/%.o: src/math/%.c include/asmlib_math.h src/math/math_private.h src/math/upstream.h | $(BUILD)
 	@mkdir -p $(dir $@)
-	$(CC) $(MATH_CFLAGS) -msse4.1 -c -o $@ $<
+	$(CC) $(MATH_CFLAGS) -msse4.1 -mfma -c -o $@ $<
 
 $(BUILD)/test_math_%: tests/test_math_%.c tests/math_test.h $(MATH_OBJ) include/asmlib_math.h | $(BUILD)
 	$(CC) $(MATH_CFLAGS) -o $@ $< $(MATH_OBJ) -lm

@@ -49,6 +49,8 @@ examples/   a practical word-frequency analyser built on asmlib
 
 * x86-64 CPU with **AVX2** and **BMI1** (`tzcnt`). The library does not fall
   back to scalar code, so query support first if you must run on older CPUs:
+  the native math kernels are also compiled with FMA (`-mfma`), which is
+  implied by AVX2 on every real CPU; the wasm32 build uses no FMA.
 
   ```c
   #include "asmlib.h"
@@ -435,32 +437,31 @@ development machine (glibc 2.44):
 
 ```
 function         libm     asmlib   speedup
-sqrt             1.97       1.89     1.04x
-floor            1.93       1.93     1.00x
-cbrt            21.19       9.62     2.20x
-fmod             9.05       8.70     1.04x
-exp              6.60       6.77     0.98x
-exp2             5.67       5.40     1.05x
-expm1            5.70       8.19     0.70x
-log              6.82       7.99     0.85x
-log2             6.40       9.90     0.65x
-pow             20.93      26.93     0.78x
-sin             19.28      24.62     0.78x
-cos             17.78      25.83     0.69x
-tan             23.17      25.30     0.92x
-asin            16.40      13.16     1.25x
-atan2           24.49      28.32     0.86x
-cosh            13.04       9.51     1.37x
-sinh            12.81      26.89     0.48x
-tanh             6.10       9.08     0.67x
-asinh           26.81      22.04     1.22x
+sqrt             2.18       2.15     1.01x
+cbrt            21.98      10.67     2.06x
+fmod            13.72      14.72     0.93x
+exp              7.01       6.85     1.02x
+exp2             5.41       5.66     0.96x
+expm1            5.96      10.23     0.58x
+log              7.01       7.47     0.94x
+log2             6.92       8.11     0.85x
+pow             23.60      22.95     1.03x
+sin             20.23      26.95     0.75x
+cos             28.84      27.99     1.03x
+tan             27.03      26.07     1.04x
+asin            12.24      12.67     0.97x
+atan2           26.78      26.97     0.99x
+cosh            13.46       9.82     1.37x
+sinh            14.84      28.17     0.53x
+tanh             6.64       9.68     0.69x
+asinh           28.45      20.70     1.37x
 ```
 
-The library is now broadly at glibc parity: `cbrt` is more than twice as fast,
-`cosh`/`asin`/`asinh`/`acos`/`sincos`/`exp2`/`sqrt`/`fmod` are at or above
-parity, and the rest sit within roughly 0.6-0.9x. The remaining gap is glibc's
-hand-tuned FMA assembly; this library deliberately uses no FMA or OS-specific
-code so the same sources run unchanged on WebAssembly. The earlier double-double
+`cbrt` is more than twice as fast, `pow`/`exp`/`cos`/`tan`/`cosh`/`asinh` are
+at or above parity, and the rest sit within roughly 0.6-1.0x of glibc's
+hand-tuned kernels. Native builds use FMA (implied by AVX2) for the kernels
+that support it; the wasm32 build stays FMA-free and uses the portable
+fallbacks, so the same sources run unchanged there. The earlier double-double
 kernels (which cost 20-60x for `exp`/`pow`/`sinh`) are gone.
 
 ### Profiling with perf
