@@ -30,6 +30,12 @@ MATH_TEST_SRC := $(wildcard tests/test_math_*.c)
 MATH_TEST_BIN := $(patsubst tests/%.c,$(BUILD)/%,$(MATH_TEST_SRC))
 WASM_CC     ?= clang --target=wasm32-unknown-unknown
 
+# ---- portable C backend for wasm/freestanding (memory, string, allocator) ---
+LIBC_SRC      := $(wildcard src/libc/*.c)
+LIBC_CFLAGS   := -O2 -std=c11 -ffreestanding -fno-builtin -fno-stack-protector \
+                 -Wall -Wextra -Isrc/libc
+LIBC_TEST_BIN := $(BUILD)/test_portable $(BUILD)/test_portable_alloc
+
 TEST_BIN      := $(BUILD)/test_asmlib
 TEST_ARENA_BIN:= $(BUILD)/test_arena
 TEST_ALLOC_BIN:= $(BUILD)/test_alloc
@@ -39,7 +45,7 @@ MATH_BENCH_BIN  := $(BUILD)/math_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math bench bench-arena bench-alloc bench-math perfbench example clean wasm
+.PHONY: all test test-valgrind test-asan test-math test-libc bench bench-arena bench-alloc bench-math perfbench example clean wasm
 
 all: $(STATIC) $(SHARED)
 
@@ -148,20 +154,31 @@ $(BUILD)/test_math_%: tests/test_math_%.c tests/math_test.h $(MATH_OBJ) include/
 test-math: $(MATH_TEST_BIN)
 	@for t in $(MATH_TEST_BIN); do ./$$t || exit 1; done
 
-# Compile every math source for wasm32 (freestanding). The objects are always
-# built; the wasm module is linked when wasm-ld is available. Defining
-# ASMLIB_MATH_STD_NAMES makes the module export standard <math.h> symbols.
+# ---- portable C backend (memory, string, allocator) for wasm ----------------
+$(BUILD)/test_portable: tests/test_portable.c src/libc/mem.c src/libc/str.c src/libc/portable.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -o $@ tests/test_portable.c src/libc/mem.c src/libc/str.c
+
+$(BUILD)/test_portable_alloc: tests/test_portable_alloc.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -o $@ tests/test_portable_alloc.c src/libc/alloc.c
+
+test-libc: $(LIBC_TEST_BIN)
+	@for t in $(LIBC_TEST_BIN); do ./$$t || exit 1; done
+
+# Compile every math and portable-libc source for wasm32 (freestanding). The
+# objects are always built; the module is linked when wasm-ld is available.
+# ASMLIB_MATH_STD_NAMES/ASMLIB_LIBC_STD_NAMES make the module export standard
+# <math.h>/libc symbols, so it is a drop-in freestanding libc + libm.
 wasm:
 	@rm -rf $(BUILD)/wasm
 	@mkdir -p $(BUILD)/wasm
-	@for f in $(MATH_SRC); do \
+	@for f in $(MATH_SRC) $(LIBC_SRC); do \
 		o=$(BUILD)/wasm/$$(basename $$f .c).o; \
-		$(WASM_CC) $(MATH_CFLAGS) -DASMLIB_MATH_STD_NAMES -c -o $$o $$f || exit 1; \
+		$(WASM_CC) $(MATH_CFLAGS) -Isrc/libc -DASMLIB_MATH_STD_NAMES -DASMLIB_LIBC_STD_NAMES -c -o $$o $$f || exit 1; \
 	done
 	@echo "wasm objects built in $(BUILD)/wasm"
 	@if command -v wasm-ld >/dev/null 2>&1; then \
-		wasm-ld --no-entry --export-all -o $(BUILD)/asmlib_math.wasm $(BUILD)/wasm/*.o && \
-		echo "linked $(BUILD)/asmlib_math.wasm"; \
+		wasm-ld --no-entry --export-all -o $(BUILD)/asmlib.wasm $(BUILD)/wasm/*.o && \
+		echo "linked $(BUILD)/asmlib.wasm"; \
 	else \
 		echo "wasm-ld not installed: objects compiled, module not linked"; \
 	fi

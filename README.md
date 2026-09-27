@@ -11,8 +11,9 @@ header plus static and shared libraries.
 ```
 src/        NASM sources (one module per area)
 src/math/   freestanding C math library (no libc; builds for wasm32)
+src/libc/   portable C memory/string/allocator backend for wasm/freestanding
 include/    asmlib.h — the public C API; asmlib_math.h — the math API
-tests/      differential + page-boundary + arena + malloc + math suites
+tests/      differential + page-boundary + arena + malloc + math + portable suites
 bench/      asmlib vs. libc micro-benchmarks, arena/malloc vs. malloc
 examples/   a practical word-frequency analyser built on asmlib
 ```
@@ -44,6 +45,10 @@ examples/   a practical word-frequency analyser built on asmlib
   exhaustive and randomised inputs, including all alignments and edge sizes.
 * **Two usage modes**: call the `asm_*` names, or define
   `ASMLIB_ENABLE_LIBC_ALIASES` to transparently replace the standard names.
+* **WebAssembly-ready.** A portable C backend (`src/libc/`) brings the memory,
+  string and allocator API to freestanding targets, and `make wasm` links it
+  with the math library into `build/asmlib.wasm` — a no-import module exporting
+  the standard libc/libm names.
 
 ## Requirements
 
@@ -71,8 +76,9 @@ make bench-arena    # arena and asm_malloc vs. libc malloc (same binary)
 make bench-alloc    # alias for bench-arena
 make example    # run the word-frequency example
 make test-math  # run the freestanding double-precision math differential tests
+make test-libc  # run the portable (wasm) memory/string/allocator tests
 make bench-math # benchmark the math library against the host libm
-make wasm       # compile src/math/*.c for wasm32 and link build/asmlib_math.wasm
+make wasm       # build the freestanding wasm32 module (math + portable libc)
 make clean
 ```
 
@@ -274,9 +280,10 @@ double s, c; asm_sincos(0.5, &s, &c);  /* one shared reduction */
 over special values and millions of randomised inputs, reporting the worst ULP
 difference. `cbrt` is checked independently by cubing the result in
 `long double` (glibc's own `cbrt` is up to 3 ulp off), so its accuracy does not
-depend on the host libm. `make wasm` compiles the whole library to `wasm32` and
-links `build/asmlib_math.wasm`; the module has **no imports** and exports the
-standard `<math.h>` names, so it drops into any WebAssembly host.
+depend on the host libm. `make wasm` compiles every math and `src/libc` source
+to `wasm32` and links `build/asmlib.wasm`; the module has **no imports** and
+exports the standard names (`sin`, `exp`, …, `memcpy`, `strlen`, `malloc`, …),
+so it is a drop-in freestanding libm + libc subset for WebAssembly.
 
 ## Design notes
 
@@ -517,8 +524,19 @@ but the library itself does not.
 The math library (`src/math/`) is freestanding by construction: it calls no
 libc or `libm`, sets no `errno`, uses no floating-point environment and keeps
 no global state, so a `wasm32` build (or any freestanding target) links with
-nothing. `make wasm` compiles every math source to a `wasm32` object with only
-the linker-provided `__stack_pointer` undefined.
+nothing.
+
+`src/libc/` is a portable C implementation of the same memory, string and
+allocator API (`memcpy`, `strlen`, `strlcpy`, `malloc`, `posix_memalign`, …)
+for targets where the NASM code cannot run. It is freestanding (no libc) and
+its allocator serves a single-threaded first-fit free list from `__heap_base`,
+growing WebAssembly linear memory with `memory.grow` on demand (a fixed static
+pool is used in the native tests). `make test-libc` differentially tests it
+against the host libc, including a guard-page suite; `make wasm` links it
+together with the math library into `build/asmlib.wasm`, a **complete
+freestanding libc-subset + libm** module with no imports. The arena allocator
+is not yet available on wasm (it is NASM today); the portable `malloc` is the
+wasm allocator.
 
 ## Porting to AArch64
 

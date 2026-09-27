@@ -1,9 +1,10 @@
 # Include paths for the test harnesses. clangd's generic fallback runs with the
 # test file's directory (tests/) as its working directory, so these are
 # relative to tests: include/ for asmlib.h and asmlib_math.h, src/ for
-# common.inc, src/math/ for math_private.h.
+# common.inc, src/math/ for math_private.h, src/libc/ for portable.h.
 CompileFlags:
   Add:
     - -I../include
     - -I../src
     - -I../src/math
+    - -I../src/libc
