@@ -39,13 +39,14 @@ LIBC_TEST_BIN := $(BUILD)/test_portable $(BUILD)/test_portable_alloc
 TEST_BIN      := $(BUILD)/test_asmlib
 TEST_ARENA_BIN:= $(BUILD)/test_arena
 TEST_ALLOC_BIN:= $(BUILD)/test_alloc
+TEST_MT_BIN   := $(BUILD)/test_alloc_mt $(BUILD)/test_portable_alloc_mt
 BENCH_BIN     := $(BUILD)/bench
 BENCH_ARENA_BIN := $(BUILD)/bench_arena
 MATH_BENCH_BIN  := $(BUILD)/math_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math test-libc bench bench-arena bench-alloc bench-math perfbench example clean wasm
+.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm
 
 all: $(STATIC) $(SHARED)
 
@@ -73,10 +74,23 @@ $(TEST_ARENA_BIN): tests/test_arena.c $(STATIC) $(HEADER)
 $(TEST_ALLOC_BIN): tests/test_alloc.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ tests/test_alloc.c $(STATIC) $(LDFLAGS)
 
-test: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN)
+# Multithreaded allocator stress tests (native asm heap and portable heap).
+$(BUILD)/test_alloc_mt: tests/test_alloc_mt.c $(STATIC) $(HEADER)
+	$(CC) $(CFLAGS) -pthread -o $@ tests/test_alloc_mt.c $(STATIC) $(LDFLAGS)
+
+$(BUILD)/test_portable_alloc_mt: tests/test_portable_alloc_mt.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -pthread -o $@ tests/test_portable_alloc_mt.c src/libc/alloc.c
+
+test: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN) $(TEST_MT_BIN)
 	./$(TEST_BIN)
 	./$(TEST_ARENA_BIN)
 	./$(TEST_ALLOC_BIN)
+	./$(BUILD)/test_alloc_mt
+	./$(BUILD)/test_portable_alloc_mt
+
+test-mt: $(TEST_MT_BIN)
+	./$(BUILD)/test_alloc_mt
+	./$(BUILD)/test_portable_alloc_mt
 
 # Run the suites under valgrind; fails on any invalid read/write or leak.
 # --undef-value-errors=no silences valgrind's inability to model AVX2 register

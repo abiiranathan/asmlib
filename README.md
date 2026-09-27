@@ -77,6 +77,7 @@ make bench-alloc    # alias for bench-arena
 make example    # run the word-frequency example
 make test-math  # run the freestanding double-precision math differential tests
 make test-libc  # run the portable (wasm) memory/string/allocator tests
+make test-mt    # run the multithreaded allocator stress tests
 make bench-math # benchmark the math library against the host libm
 make wasm       # build the freestanding wasm32 module (math + portable libc)
 make clean
@@ -211,7 +212,11 @@ must be freed individually rather than in bulk.
 Small requests come from per-size-class slab runs replenished by `mmap`;
 requests above 4080 bytes get an individual page-rounded mapping. Pointers
 from `asm_malloc` must be released with `asm_free` (and not with libc `free`).
-The heap is single-threaded and small-class runs are retained for reuse.
+The heap is thread-safe: a single global spinlock serialises the free lists and
+the large-mapping path, so `asm_malloc`/`asm_free`/`asm_realloc`/… may be called
+concurrently from multiple threads in one address space. (The lock is a
+spinlock, so the allocator is not async-signal-safe, and the arena allocator
+remains single-threaded by design.) Small-class runs are retained for reuse.
 `asm_posix_memalign`/`asm_aligned_alloc` support any power-of-two alignment
 via a small indirect header, and the resulting pointers are released normally
 with `asm_free` (and may be passed to `asm_realloc`).
@@ -345,7 +350,7 @@ so it is a drop-in freestanding libm + libc subset for WebAssembly.
   replenished by a slab run; larger requests get their own page-rounded
   mapping. Every block is 16-byte aligned and carries a 16-byte header with
   its class (or the mapping length), so `free` needs no size argument. The
-  heap is single-threaded and retains small-class runs.
+  heap is thread-safe (spinlock) and retains small-class runs.
 
 ### Performance approach
 
@@ -380,7 +385,10 @@ re-verified so any overlap or corruption is caught).
 `tests/test_alloc.c` covers the malloc-style heap: alignment, `calloc`
 zeroing, `realloc` in place and across the small/large boundary, and a
 200,000-operation randomised alloc/free/realloc stress test with content
-tagging.
+tagging. `make test` also runs the multithreaded stress tests
+(`tests/test_alloc_mt.c` and `tests/test_portable_alloc_mt.c`): several threads
+run millions of mixed allocate/free/realloc operations with per-block tags and
+report any corruption, exercising both allocators' locks.
 
 `make test-math` runs one differential binary per math family
 (`tests/test_math_*.c`). Each compares the implementation against the host
@@ -435,8 +443,8 @@ The arena wins because allocation is a pointer bump, the memory is contiguous
 (cache-predictable), and a reset is one rewind rather than thousands of
 `free` calls. The malloc heap wins over glibc on burst workloads because its
 per-class free lists are a couple of instructions. The trade-offs — the arena
-reclaims in bulk or to a mark, and the malloc heap is single-threaded and
-retains small-class runs — are the usual ones for these designs.
+reclaims in bulk or to a mark, and the arena stays single-threaded while the
+malloc heap takes a lock, are the usual ones for these designs.
 
 `make bench-math` runs `bench/math_bench.c`, which times every math routine
 against the host `libm` on representative inputs (best of 7, ns/call). On the
@@ -529,9 +537,11 @@ nothing.
 `src/libc/` is a portable C implementation of the same memory, string and
 allocator API (`memcpy`, `strlen`, `strlcpy`, `malloc`, `posix_memalign`, …)
 for targets where the NASM code cannot run. It is freestanding (no libc) and
-its allocator serves a single-threaded first-fit free list from `__heap_base`,
+its allocator serves a first-fit free list from `__heap_base`,
 growing WebAssembly linear memory with `memory.grow` on demand (a fixed static
-pool is used in the native tests). `make test-libc` differentially tests it
+pool is used in the native tests). The portable allocator is also thread-safe
+(C11 atomics; a no-op lock on wasm builds without threads). `make test-libc`
+differentially tests it
 against the host libc, including a guard-page suite; `make wasm` links it
 together with the math library into `build/asmlib.wasm`, a **complete
 freestanding libc-subset + libm** module with no imports. The arena allocator

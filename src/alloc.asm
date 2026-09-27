@@ -29,9 +29,13 @@
 ;   backing block with room for the alignment slack, then stamping an indirect
 ;   header in front of the aligned payload.
 ;
-; The allocator is single-threaded and never returns small-run memory to the
-; kernel (like a slab); large blocks are returned. That matches the usual
-; malloc workhorse pattern while staying small and dependency free.
+; The heap is thread-safe via a single global spinlock (malloc_lock) that
+; serialises every free-list and header update, so concurrent callers can share
+; one address space. It is not async-signal-safe: do not call these routines
+; from a signal handler that may interrupt an allocation on the same thread.
+; Small-run memory is never returned to the kernel (like a slab); large blocks
+; are. That matches the usual malloc workhorse pattern while staying small and
+; dependency free.
 ;==============================================================================
 
 BITS 64
@@ -54,13 +58,16 @@ extern asm_sys_munmap
 section .bss
 align 64
 malloc_freelist: resq NUM_CLASSES       ; one singly-linked list per size class
+align 64
+malloc_lock:     resd 1                 ; global spinlock: 0 = free, 1 = held
 
 section .text
 
 ;==============================================================================
-; void *asm_malloc(size_t size)
+; internal: L_malloc(size_t size) -> void *
 ;------------------------------------------------------------------------------
-; Returns a 16-byte aligned block of at least size bytes, or NULL.
+; Unlocked core of asm_malloc. Returns a 16-byte aligned block of at least
+; size bytes, or NULL. Callers must already hold malloc_lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = size (size_t)  - requested payload size (0 is treated as 1)
@@ -70,8 +77,7 @@ section .text
 ;   Reads rdi; writes rax, rcx, rdx, r8, r9. Pushes/restores rbx.
 ;   Calls L_alloc_run for small blocks and asm_sys_mmap for large ones.
 ;==============================================================================
-global asm_malloc:function
-asm_malloc:
+L_malloc:
     ; ---- prologue: preserve callee-saved register ----
     push    rbx                         ; preserve callee-saved register
     ; ---- normalise a zero-size request ----
@@ -131,10 +137,31 @@ asm_malloc:
     ret                                 ; return NULL
 
 ;==============================================================================
-; void asm_free(void *ptr)
+; void *asm_malloc(size_t size)
 ;------------------------------------------------------------------------------
-; Releases a block from asm_malloc (ptr may be NULL). Do not pass pointers
-; from any other allocator.
+; Thread-safe front end: holds malloc_lock for the whole of L_malloc.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = size (size_t)  - requested payload size
+; Returns:
+;   rax = payload pointer, or NULL
+;==============================================================================
+global asm_malloc:function
+asm_malloc:
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    call    L_lock                      ; enter the critical section
+    call    L_malloc                    ; allocate under the lock
+    mov     rbx, rax                    ; stash the result across the unlock
+    call    L_unlock                    ; leave the critical section
+    mov     rax, rbx                    ; restore the result
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return the block
+
+;==============================================================================
+; internal: L_free(void *ptr) -> void
+;------------------------------------------------------------------------------
+; Unlocked core of asm_free. Releases a block from asm_malloc (ptr may be NULL).
+; Callers must already hold malloc_lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = ptr (void *)  - block previously returned by asm_malloc
@@ -142,11 +169,11 @@ asm_malloc:
 ;   rax = unused (void)
 ; Uses / clobbers:
 ;   Reads rdi; writes rax, r8, r9. Small blocks are pushed back on their class
-;   list; large blocks tail-call asm_sys_munmap; indirect (over-aligned) blocks
-;   tail-call asm_free on their backing block. No callee-saved registers used.
+;   list; large blocks call asm_sys_munmap under the lock; indirect
+;   (over-aligned) blocks recurse into L_free on their backing block. No
+;   callee-saved registers used.
 ;==============================================================================
-global asm_free:function
-asm_free:
+L_free:
     ; ---- NULL is a no-op ----
     test    rdi, rdi                    ; ptr == NULL?
     jz      .ret                        ; free(NULL) is a no-op
@@ -168,12 +195,37 @@ asm_free:
     mov     rdi, [rdi-HDR+8]            ; rdi = orig backing block
     test    rdi, rdi                    ; orig == NULL?
     jz      .ret                        ; nothing to release
-    jmp     asm_free                    ; tail-call free(orig)
+    sub     rsp, 8                      ; keep rsp 16-byte aligned for the call
+    call    L_free                      ; recurse (orig is never indirect)
+    add     rsp, 8                      ; restore the stack
+    ret                                 ; return
     ; ---- large: unmap the whole mapping ----
 .large:
     mov     rsi, [rdi-HDR+8]            ; mapped length
     sub     rdi, HDR                    ; mapping base
-    jmp     asm_sys_munmap              ; tail-call munmap(base, length)
+    sub     rsp, 8                      ; keep rsp 16-byte aligned for the call
+    call    asm_sys_munmap              ; release the mapping (under the lock)
+    add     rsp, 8                      ; restore the stack
+    ret                                 ; return
+
+;==============================================================================
+; void asm_free(void *ptr)
+;------------------------------------------------------------------------------
+; Thread-safe front end: holds malloc_lock around L_free.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = ptr (void *)  - block previously returned by asm_malloc
+; Returns:
+;   rax = unused (void)
+;==============================================================================
+global asm_free:function
+asm_free:
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    call    L_lock                      ; enter the critical section
+    call    L_free                      ; release under the lock
+    call    L_unlock                    ; leave the critical section
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return
 
 ;==============================================================================
 ; void *asm_calloc(size_t count, size_t size)
@@ -187,7 +239,7 @@ asm_free:
 ;   rax = zeroed block, or NULL on overflow or allocation failure
 ; Uses / clobbers:
 ;   Reads rdi, rsi; writes rax, rdx. Pushes/restores rbx, r12, r13.
-;   Calls asm_malloc and asm_memset.
+;   Calls L_malloc under the lock, then asm_memset outside it.
 ;==============================================================================
 global asm_calloc:function
 asm_calloc:
@@ -205,13 +257,16 @@ asm_calloc:
     jnz     .go                         ; non-zero -> allocate as is
     mov     ebx, 1                      ; treat zero request as 1 byte
 .go:
-    ; ---- allocate and zero the block ----
+    ; ---- allocate under the lock ----
+    call    L_lock                      ; enter the critical section
     mov     rdi, rbx                    ; arg1 = total bytes
-    call    asm_malloc                  ; allocate the block
-    test    rax, rax                    ; allocation succeeded?
-    jz      .fail                       ; failed -> return NULL
+    call    L_malloc                    ; allocate the block
     mov     r12, rax                    ; keep the block
-    mov     rdi, rax                    ; arg1 = block
+    call    L_unlock                    ; leave the critical section
+    ; ---- zero the block outside the lock (it is on no free list) ----
+    test    r12, r12                    ; allocation succeeded?
+    jz      .fail                       ; failed -> return NULL
+    mov     rdi, r12                    ; arg1 = block
     xor     esi, esi                    ; fill byte = 0
     mov     rdx, rbx                    ; arg3 = total bytes
     call    asm_memset                  ; zero it
@@ -228,12 +283,13 @@ asm_calloc:
     ret                                 ; return
 
 ;==============================================================================
-; void *asm_realloc(void *ptr, size_t size)
+; internal: L_realloc(void *ptr, size_t size) -> void *
 ;------------------------------------------------------------------------------
-; Grows or shrinks a block. Keeps the pointer when the request fits the
-; existing usable size, otherwise allocates, copies min(old,new) and frees.
-; Over-aligned (indirect) blocks always move through asm_malloc. ptr NULL
-; behaves like asm_malloc(size); size 0 frees and returns NULL.
+; Unlocked core of asm_realloc. Grows or shrinks a block. Keeps the pointer
+; when the request fits the existing usable size, otherwise allocates, copies
+; min(old,new) and frees. Over-aligned (indirect) blocks always move through
+; L_malloc. ptr NULL behaves like L_malloc(size); size 0 frees and returns
+; NULL. Callers must already hold malloc_lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = ptr (void *)  - existing block, or NULL
@@ -242,10 +298,9 @@ asm_calloc:
 ;   rax = resized block, or NULL on overflow or allocation failure
 ; Uses / clobbers:
 ;   Reads rdi, rsi; writes rax, rdx. Pushes/restores rbx and r12-r15.
-;   Calls asm_malloc, asm_malloc_usable_size, asm_memcpy and asm_free.
+;   Calls L_malloc, L_usable_size, asm_memcpy and L_free.
 ;==============================================================================
-global asm_realloc:function
-asm_realloc:
+L_realloc:
     ; ---- prologue: preserve callee-saved registers ----
     push    rbx                         ; preserve callee-saved registers
     push    r12                         ; save ptr
@@ -286,7 +341,7 @@ asm_realloc:
 .indirect_old:
     mov     rbx, [r12-HDR+8]            ; rbx = orig backing block
     mov     rdi, rbx                    ; arg1 = orig
-    call    asm_malloc_usable_size      ; rax = backing usable
+    call    L_usable_size               ; rax = backing usable
     mov     rcx, r12                    ; rcx = ptr
     sub     rcx, rbx                    ; rcx = ptr - orig (header offset)
     sub     rax, rcx                    ; usable -= the alignment offset
@@ -294,7 +349,7 @@ asm_realloc:
     ; ---- allocate a new block, copy and free the old ----
 .move:
     mov     rdi, r13                    ; allocate a new block
-    call    asm_malloc                  ; allocate the new block
+    call    L_malloc                    ; allocate the new block
     test    rax, rax                    ; allocation succeeded?
     jz      .fail                       ; failed -> return NULL
     mov     r15, rax                    ; r15 = new block
@@ -307,7 +362,7 @@ asm_realloc:
     mov     rsi, r12                    ; arg2 = source
     call    asm_memcpy                  ; copy the live prefix
     mov     rdi, r12                    ; release the old block
-    call    asm_free                    ; release the old block
+    call    L_free                      ; release the old block
     mov     rax, r15                    ; rax = new block
     jmp     .done                       ; return new block
     ; ---- in place: keep the pointer ----
@@ -316,12 +371,12 @@ asm_realloc:
     jmp     .done                       ; return in-place block
 .alloc:
     mov     rdi, r13                    ; arg1 = new size
-    call    asm_malloc                  ; realloc(NULL,n) -> malloc(n)
+    call    L_malloc                    ; realloc(NULL,n) -> malloc(n)
     jmp     .done                       ; return the new block
     ; ---- zero size: free and return NULL ----
 .free_null:
     mov     rdi, r12                    ; arg1 = ptr
-    call    asm_free                    ; release the block
+    call    L_free                      ; release the block
     xor     eax, eax                    ; rax = NULL
     jmp     .done                       ; return NULL
     ; ---- failure path ----
@@ -337,11 +392,33 @@ asm_realloc:
     ret                                 ; return
 
 ;==============================================================================
+; void *asm_realloc(void *ptr, size_t size)
+;------------------------------------------------------------------------------
+; Thread-safe front end: holds malloc_lock for the whole of L_realloc.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = ptr (void *)  - existing block, or NULL
+;   rsi = size (size_t)  - requested new payload size
+; Returns:
+;   rax = resized block, or NULL
+;==============================================================================
+global asm_realloc:function
+asm_realloc:
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    call    L_lock                      ; enter the critical section
+    call    L_realloc                   ; resize under the lock
+    mov     rbx, rax                    ; stash the result across the unlock
+    call    L_unlock                    ; leave the critical section
+    mov     rax, rbx                    ; restore the result
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return the block
+
+;==============================================================================
 ; void *asm_reallocarray(void *ptr, size_t count, size_t size)
 ;------------------------------------------------------------------------------
 ; Overflow-checked asm_realloc. When count != 0 and size > SIZE_MAX/count the
 ; product would wrap; NULL is returned and ptr is left untouched. Otherwise the
-; request is forwarded to asm_realloc(ptr, count*size).
+; request is forwarded to the internal L_realloc under a single lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = ptr (void *)  - existing block, or NULL
@@ -350,7 +427,7 @@ asm_realloc:
 ; Returns:
 ;   rax = resized block, or NULL on overflow or allocation failure
 ; Uses / clobbers:
-;   Reads rdi, rsi, rdx; writes rax, rcx, rdx, r8. Tail-calls asm_realloc.
+;   Reads rdi, rsi, rdx; writes rax, rcx, rdx, r8. Calls L_realloc under the lock.
 ;==============================================================================
 global asm_reallocarray:function
 asm_reallocarray:
@@ -368,21 +445,31 @@ asm_reallocarray:
     mov     rax, rsi                    ; rax = count
     mul     r8                          ; rdx:rax = count * size (high half is 0)
     mov     rsi, rax                    ; arg2 = product
-    jmp     asm_realloc                 ; tail-call realloc(ptr, product)
+    jmp     .locked                     ; realloc(ptr, product) under the lock
 .zero:
     xor     esi, esi                    ; arg2 = 0
-    jmp     asm_realloc                 ; realloc(ptr, 0) frees ptr and returns NULL
+.locked:
+    ; ---- serialise the resize with the rest of the heap ----
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    call    L_lock                      ; enter the critical section
+    call    L_realloc                   ; resize under the lock
+    mov     rbx, rax                    ; stash the result across the unlock
+    call    L_unlock                    ; leave the critical section
+    mov     rax, rbx                    ; restore the result
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return the resized block
 .overflow:
     xor     eax, eax                    ; rax = NULL (overflow)
     ret                                 ; return NULL without touching ptr
 
 ;==============================================================================
-; size_t asm_malloc_usable_size(void *ptr)
+; internal: L_usable_size(void *ptr) -> size_t
 ;------------------------------------------------------------------------------
-; Usable payload bytes in a block from asm_malloc, or 0 for NULL. A small
-; class block reports class*16 - header; a large block reports its mapped
-; length minus the header; an over-aligned (indirect) block reports its backing
-; block's usable size minus the alignment offset.
+; Unlocked core of asm_malloc_usable_size. Usable payload bytes in a block from
+; asm_malloc, or 0 for NULL. A small class block reports class*16 - header; a
+; large block reports its mapped length minus the header; an over-aligned
+; (indirect) block reports its backing block's usable size minus the alignment
+; offset. Callers must already hold malloc_lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = ptr (void *)  - block previously returned by asm_malloc, or NULL
@@ -391,8 +478,7 @@ asm_reallocarray:
 ; Uses / clobbers:
 ;   Reads rdi; writes rax, rcx, rdx, r8. No callee-saved registers used.
 ;==============================================================================
-global asm_malloc_usable_size:function
-asm_malloc_usable_size:
+L_usable_size:
     ; ---- NULL has no usable bytes ----
     test    rdi, rdi                    ; ptr == NULL?
     jz      .null                       ; yes -> 0
@@ -431,12 +517,34 @@ asm_malloc_usable_size:
     ret                                 ; return 0
 
 ;==============================================================================
-; void *asm_aligned_alloc(size_t alignment, size_t size)
+; size_t asm_malloc_usable_size(void *ptr)
 ;------------------------------------------------------------------------------
-; Allocates `size` bytes whose address is a multiple of `alignment` (a
-; non-zero power of two), or NULL on invalid alignment or allocation failure.
-; C11 would also require size to be a multiple of alignment; we deliberately
-; relax that and accept any size.
+; Thread-safe front end: holds malloc_lock while L_usable_size reads the header.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = ptr (void *)  - block previously returned by asm_malloc, or NULL
+; Returns:
+;   rax = usable payload bytes, or 0 when ptr is NULL
+;==============================================================================
+global asm_malloc_usable_size:function
+asm_malloc_usable_size:
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    call    L_lock                      ; enter the critical section
+    call    L_usable_size               ; read the header under the lock
+    mov     rbx, rax                    ; stash the result across the unlock
+    call    L_unlock                    ; leave the critical section
+    mov     rax, rbx                    ; restore the result
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return usable bytes
+
+;==============================================================================
+; internal: L_aligned_alloc(size_t alignment, size_t size) -> void *
+;------------------------------------------------------------------------------
+; Unlocked core of asm_aligned_alloc. Allocates `size` bytes whose address is a
+; multiple of `alignment` (a non-zero power of two), or NULL on invalid
+; alignment or allocation failure. C11 would also require size to be a multiple
+; of alignment; we deliberately relax that and accept any size. Callers must
+; already hold malloc_lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = alignment (size_t)  - required alignment (power of two)
@@ -445,10 +553,9 @@ asm_malloc_usable_size:
 ;   rax = aligned block, or NULL on invalid alignment or failure
 ; Uses / clobbers:
 ;   Reads rdi, rsi; writes rax, rcx, rdx. Pushes/restores rbx and r12, r13.
-;   Calls asm_malloc.
+;   Calls L_malloc.
 ;==============================================================================
-global asm_aligned_alloc:function
-asm_aligned_alloc:
+L_aligned_alloc:
     ; ---- validate the alignment (non-zero power of two) ----
     test    rdi, rdi                    ; alignment == 0?
     jz      .bad                        ; invalid -> NULL
@@ -458,9 +565,9 @@ asm_aligned_alloc:
     jnz     .bad                        ; not a power of two -> NULL
     cmp     rdi, 16                     ; alignment <= 16?
     ja      .big                        ; over-aligned -> indirect block
-    ; ---- alignment <= 16: asm_malloc is already 16-byte aligned ----
+    ; ---- alignment <= 16: L_malloc is already 16-byte aligned ----
     mov     rdi, rsi                    ; arg1 = size
-    jmp     asm_malloc                  ; tail-call malloc(size)
+    jmp     L_malloc                    ; tail-call malloc(size)
     ; ---- over-aligned: carve an indirect block ----
 .big:
     ; ---- prologue: preserve callee-saved registers ----
@@ -477,7 +584,7 @@ asm_aligned_alloc:
     jc      .fail                       ; overflow -> fail
     ; ---- allocate the backing block ----
     mov     rdi, rbx                    ; arg1 = total bytes
-    call    asm_malloc                  ; orig = malloc(total)
+    call    L_malloc                    ; orig = malloc(total)
     test    rax, rax                    ; allocation succeeded?
     jz      .fail                       ; failed -> return NULL
     ; ---- p = align_up(orig + header, alignment) ----
@@ -508,6 +615,28 @@ asm_aligned_alloc:
     ret                                 ; return NULL
 
 ;==============================================================================
+; void *asm_aligned_alloc(size_t alignment, size_t size)
+;------------------------------------------------------------------------------
+; Thread-safe front end: holds malloc_lock for the whole of L_aligned_alloc.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = alignment (size_t)  - required alignment (power of two)
+;   rsi = size (size_t)  - requested payload size
+; Returns:
+;   rax = aligned block, or NULL on invalid alignment or failure
+;==============================================================================
+global asm_aligned_alloc:function
+asm_aligned_alloc:
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    call    L_lock                      ; enter the critical section
+    call    L_aligned_alloc             ; allocate under the lock
+    mov     rbx, rax                    ; stash the result across the unlock
+    call    L_unlock                    ; leave the critical section
+    mov     rax, rbx                    ; restore the result
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return the aligned block
+
+;==============================================================================
 ; int asm_posix_memalign(void **memptr, size_t alignment, size_t size)
 ;------------------------------------------------------------------------------
 ; POSIX posix_memalign: stores an `alignment`-aligned block of `size` bytes at
@@ -523,7 +652,7 @@ asm_aligned_alloc:
 ;   rax = 0 on success, EINVAL(22) on bad alignment, ENOMEM(12) on failure
 ; Uses / clobbers:
 ;   Reads rdi, rsi, rdx; writes rax and *memptr. Pushes/restores rbx.
-;   Calls asm_aligned_alloc.
+;   Calls L_aligned_alloc under the lock.
 ;==============================================================================
 global asm_posix_memalign:function
 asm_posix_memalign:
@@ -539,23 +668,26 @@ asm_posix_memalign:
     jnz     .einval                     ; not a power of two -> EINVAL
     cmp     rsi, 8                      ; alignment < sizeof(void*)?
     jb      .einval                     ; too small -> EINVAL
-    ; ---- allocate and hand the block back ----
+    ; ---- allocate under the lock and hand the block back ----
+    call    L_lock                      ; enter the critical section
     mov     rdi, rsi                    ; arg1 = alignment
     mov     rsi, rdx                    ; arg2 = size
-    call    asm_aligned_alloc           ; p = aligned_alloc(align, size)
+    call    L_aligned_alloc             ; p = aligned_alloc(align, size)
     test    rax, rax                    ; allocation succeeded?
-    jz      .enomem                     ; failed -> ENOMEM
+    jz      .enomem                     ; failed -> release the lock, ENOMEM
     mov     [rbx], rax                  ; *memptr = p (only on success)
+    call    L_unlock                    ; leave the critical section
     xor     eax, eax                    ; return 0 (success)
     pop     rbx                         ; restore out-parameter
     ret                                 ; return 0
-    ; ---- invalid alignment -> EINVAL ----
+    ; ---- invalid alignment -> EINVAL (no lock taken) ----
 .einval:
     mov     eax, 22                     ; EINVAL
     pop     rbx                         ; restore out-parameter
     ret                                 ; return EINVAL
-    ; ---- allocation failure -> ENOMEM ----
+    ; ---- allocation failure -> ENOMEM (lock held) ----
 .enomem:
+    call    L_unlock                    ; leave the critical section
     mov     eax, 12                     ; ENOMEM
     pop     rbx                         ; restore out-parameter
     ret                                 ; return ENOMEM
@@ -638,5 +770,34 @@ L_alloc_run:
     pop     r12                         ; restore class index
     pop     rbx                         ; restore rbx
     ret                                 ; return NULL
+
+;==============================================================================
+; internal: L_lock(void) -> void
+;------------------------------------------------------------------------------
+; Acquires malloc_lock, spinning until it observes the lock free. xchg with a
+; memory operand is implicitly locked, so the test-and-set is atomic. Clobbers
+; eax only (and flags), so argument registers survive the call.
+;==============================================================================
+L_lock:
+    mov     eax, 1                      ; value to store into the lock
+.retry:
+    xchg    eax, [rel malloc_lock]      ; atomically swap in "held"
+    test    eax, eax                    ; was it already held?
+    jz      .got                        ; no -> we own it
+    pause                               ; spin hint while contended
+    mov     eax, 1                      ; reload for the next attempt
+    jmp     .retry                      ; try again
+.got:
+    ret                                 ; lock acquired
+
+;==============================================================================
+; internal: L_unlock(void) -> void
+;------------------------------------------------------------------------------
+; Releases malloc_lock. A plain store is enough because the lock only guards
+; data touched while a caller holds the lock. Clobbers no registers.
+;==============================================================================
+L_unlock:
+    mov     dword [rel malloc_lock], 0  ; mark the lock free
+    ret                                 ; return
 
 GNU_STACK_NOTE

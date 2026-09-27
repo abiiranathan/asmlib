@@ -39,15 +39,40 @@
  *   malloc_usable_size detect that header and operate on the backing block, so
  *   every aligned pointer is fully interchangeable with a plain one.
  *
- * IMPORTANT: the allocator is single-threaded and keeps its heap start and
- * free list in global state, just like the asm heap. A pointer returned here
- * must be released with asm_free and never with a host free (and vice versa).
+ * IMPORTANT: the allocator is thread-safe: every public entry point takes a
+ * global spinlock around its manipulation of the shared region and free list.
+ * It is not async-signal-safe (a signal handler must not allocate or free
+ * here). All threads share one address space, just like the asm heap, so a
+ * pointer returned here must be released with asm_free and never with a host
+ * free (and vice versa).
  *============================================================================*/
 
 #include "portable.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+/*------------------------------------------------------------------------------
+ * Global allocator lock
+ *------------------------------------------------------------------------------
+ * Every public entry point serialises the shared region and free list behind
+ * one process-wide spinlock. Native targets use C11/compiler atomics; wasm
+ * builds without the atomics feature are single-threaded, so the lock is a
+ * no-op there.
+ *----------------------------------------------------------------------------*/
+static volatile int g_lock;
+
+#if defined(__wasm__) && !defined(__wasm_atomics__)
+static inline void asm_lock(void) {}
+static inline void asm_unlock(void) {}
+#else
+static inline void asm_lock(void) {
+    while (__atomic_exchange_n(&g_lock, 1, __ATOMIC_ACQUIRE)) { }
+}
+static inline void asm_unlock(void) {
+    __atomic_store_n(&g_lock, 0, __ATOMIC_RELEASE);
+}
+#endif
 
 /*------------------------------------------------------------------------------
  * Tunables and layout
@@ -274,11 +299,12 @@ static size_t block_usable(void *ptr) {
 }
 
 /*------------------------------------------------------------------------------
- * void *asm_malloc(size_t size)
+ * internal: alloc_locked(size)
  *------------------------------------------------------------------------------
- * Returns a 16-byte aligned block of at least size bytes, or NULL.
+ * Locked core of malloc: returns a 16-byte aligned block of at least size
+ * bytes, or NULL. The caller must hold g_lock.
  *----------------------------------------------------------------------------*/
-void *ASM_LIBC(malloc)(size_t size) {
+static void *alloc_locked(size_t size) {
     size_t need;
     size_t total;
     pool_block *b;
@@ -312,6 +338,20 @@ void *ASM_LIBC(malloc)(size_t size) {
 }
 
 /*------------------------------------------------------------------------------
+ * void *asm_malloc(size_t size)
+ *------------------------------------------------------------------------------
+ * Returns a 16-byte aligned block of at least size bytes, or NULL.
+ *----------------------------------------------------------------------------*/
+void *ASM_LIBC(malloc)(size_t size) {
+    void *p;
+
+    asm_lock();
+    p = alloc_locked(size);
+    asm_unlock();
+    return p;
+}
+
+/*------------------------------------------------------------------------------
  * void *asm_calloc(size_t count, size_t size)
  *------------------------------------------------------------------------------
  * Allocates count*size zeroed bytes. The product is overflow-checked and NULL
@@ -322,30 +362,72 @@ void *ASM_LIBC(calloc)(size_t count, size_t size) {
     void *p;
 
     if (mul_ovf(count, size, &total)) return NULL;
-    p = ASM_LIBC(malloc)(total);
+    asm_lock();
+    p = alloc_locked(total);
+    asm_unlock();
     if (p == NULL) return NULL;
     mem_fill(p, 0, total);
     return p;
 }
 
 /*------------------------------------------------------------------------------
- * void asm_free(void *ptr)
+ * internal: free_locked(ptr)
  *------------------------------------------------------------------------------
- * Releases a block (ptr may be NULL). Indirect (over-aligned) pointers are
- * resolved to their backing block and released there.
+ * Locked core of free (ptr may be NULL). Indirect (over-aligned) pointers are
+ * resolved to their backing block and released there. Caller must hold g_lock.
  *----------------------------------------------------------------------------*/
-void ASM_LIBC(free)(void *ptr) {
+static void free_locked(void *ptr) {
     pool_block *h;
 
     if (ptr == NULL) return;
     h = blk_header(ptr);
     if (h->flags & BLK_INDIRECT) {
-        ASM_LIBC(free)((unsigned char *)ptr - h->size);
+        free_locked((unsigned char *)ptr - h->size);
         return;
     }
     h->flags = BLK_FREE;
     fl_insert(h);
     fl_coalesce(h);
+}
+
+/*------------------------------------------------------------------------------
+ * void asm_free(void *ptr)
+ *------------------------------------------------------------------------------
+ * Releases a block (ptr may be NULL).
+ *----------------------------------------------------------------------------*/
+void ASM_LIBC(free)(void *ptr) {
+    asm_lock();
+    free_locked(ptr);
+    asm_unlock();
+}
+
+/*------------------------------------------------------------------------------
+ * internal: realloc_locked(ptr, size)
+ *------------------------------------------------------------------------------
+ * Locked core of realloc. The block is kept in place when size still fits its
+ * usable payload, otherwise it is moved and the live prefix copied.
+ * realloc(NULL, n) == malloc(n); realloc(p, 0) frees p and returns NULL. The
+ * caller must hold g_lock.
+ *----------------------------------------------------------------------------*/
+static void *realloc_locked(void *ptr, size_t size) {
+    void *np;
+    size_t usable;
+    size_t copy;
+
+    if (ptr == NULL) return alloc_locked(size);
+    if (size == 0) {
+        free_locked(ptr);
+        return NULL;
+    }
+    usable = block_usable(ptr);
+    if (size <= usable) return ptr;
+
+    np = alloc_locked(size);
+    if (np == NULL) return NULL;
+    copy = usable < size ? usable : size;
+    mem_copy(np, ptr, copy);
+    free_locked(ptr);
+    return np;
 }
 
 /*------------------------------------------------------------------------------
@@ -356,24 +438,12 @@ void ASM_LIBC(free)(void *ptr) {
  * realloc(NULL, n) == malloc(n); realloc(p, 0) frees p and returns NULL.
  *----------------------------------------------------------------------------*/
 void *ASM_LIBC(realloc)(void *ptr, size_t size) {
-    void *np;
-    size_t usable;
-    size_t copy;
+    void *p;
 
-    if (ptr == NULL) return ASM_LIBC(malloc)(size);
-    if (size == 0) {
-        ASM_LIBC(free)(ptr);
-        return NULL;
-    }
-    usable = block_usable(ptr);
-    if (size <= usable) return ptr;
-
-    np = ASM_LIBC(malloc)(size);
-    if (np == NULL) return NULL;
-    copy = usable < size ? usable : size;
-    mem_copy(np, ptr, copy);
-    ASM_LIBC(free)(ptr);
-    return np;
+    asm_lock();
+    p = realloc_locked(ptr, size);
+    asm_unlock();
+    return p;
 }
 
 /*------------------------------------------------------------------------------
@@ -384,9 +454,13 @@ void *ASM_LIBC(realloc)(void *ptr, size_t size) {
  *----------------------------------------------------------------------------*/
 void *ASM_LIBC(reallocarray)(void *ptr, size_t count, size_t size) {
     size_t total;
+    void *p;
 
     if (mul_ovf(count, size, &total)) return NULL;
-    return ASM_LIBC(realloc)(ptr, total);
+    asm_lock();
+    p = realloc_locked(ptr, total);
+    asm_unlock();
+    return p;
 }
 
 /*------------------------------------------------------------------------------
@@ -395,18 +469,24 @@ void *ASM_LIBC(reallocarray)(void *ptr, size_t count, size_t size) {
  * Usable payload bytes in a block, or 0 for NULL.
  *----------------------------------------------------------------------------*/
 size_t ASM_LIBC(malloc_usable_size)(void *ptr) {
+    size_t n;
+
     if (ptr == NULL) return 0;
-    return block_usable(ptr);
+    asm_lock();
+    n = block_usable(ptr);
+    asm_unlock();
+    return n;
 }
 
 /*------------------------------------------------------------------------------
- * internal: aligned_new(alignment, size)
+ * internal: aligned_new_locked(alignment, size)
  *------------------------------------------------------------------------------
  * Alignment <= 16 is already guaranteed by malloc. Larger alignments carve an
  * aligned pointer out of a plain backing block and stamp an indirect header in
- * front of it; the header records the offset back to the backing payload.
+ * front of it; the header records the offset back to the backing payload. The
+ * caller must hold g_lock.
  *----------------------------------------------------------------------------*/
-static void *aligned_new(size_t alignment, size_t size) {
+static void *aligned_new_locked(size_t alignment, size_t size) {
     size_t slack;
     size_t total;
     size_t payload;
@@ -414,14 +494,14 @@ static void *aligned_new(size_t alignment, size_t size) {
     unsigned char *p;
     pool_block *h;
 
-    if (alignment <= POOL_ALIGN) return ASM_LIBC(malloc)(size);
+    if (alignment <= POOL_ALIGN) return alloc_locked(size);
 
     if (add_ovf(alignment, 2u * POOL_HDR, &slack)) return NULL;
     if (add_ovf(size, POOL_ALIGN - 1, &payload)) return NULL;
     payload &= ~(size_t)(POOL_ALIGN - 1);
     if (add_ovf(payload, slack, &total)) return NULL;
 
-    base = ASM_LIBC(malloc)(total);
+    base = alloc_locked(total);
     if (base == NULL) return NULL;
 
     p = (unsigned char *)align_up((size_t)base + 2u * POOL_HDR, alignment);
@@ -438,8 +518,13 @@ static void *aligned_new(size_t alignment, size_t size) {
  * NULL on an invalid alignment or failure. Any size is accepted.
  *----------------------------------------------------------------------------*/
 void *ASM_LIBC(aligned_alloc)(size_t alignment, size_t size) {
+    void *p;
+
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) return NULL;
-    return aligned_new(alignment, size);
+    asm_lock();
+    p = aligned_new_locked(alignment, size);
+    asm_unlock();
+    return p;
 }
 
 /*------------------------------------------------------------------------------
@@ -455,7 +540,9 @@ int ASM_LIBC(posix_memalign)(void **memptr, size_t alignment, size_t size) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
         alignment < sizeof(void *)) return POOL_EINVAL;
 
-    p = aligned_new(alignment, size);
+    asm_lock();
+    p = aligned_new_locked(alignment, size);
+    asm_unlock();
     if (p == NULL) return POOL_ENOMEM;
     *memptr = p;
     return 0;
