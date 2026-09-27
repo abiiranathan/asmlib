@@ -17,7 +17,7 @@ examples/   a practical word-frequency analyser built on asmlib
 ## Highlights
 
 * **Memory, string, comparison, search, ctype, an arena allocator and a
-  malloc-style heap** — 64 routines in all, no libc dependency anywhere.
+  malloc-style heap** — 61 routines in all, no libc dependency anywhere.
 * **AVX2 / BMI1 / BMI2** where they win: 32-byte vector scans, `tzcnt`/`bsr`
   bit-indexing, branchless ASCII case folding.
 * **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64) let
@@ -104,8 +104,9 @@ To replace libc transparently in an existing source file:
 | `void *asm_memrchr(const void *s, int c, size_t n)` | last match |
 
 ### String (`string.asm`)
-`asm_strlen`, `asm_strnlen`, `asm_strcpy`, `asm_stpcpy`, `asm_strncpy`,
-`asm_strcat`, `asm_strncat`.
+`asm_strlen`, `asm_strnlen`, `asm_strncpy`, `asm_strncat`.
+The unbounded `strcpy`, `stpcpy` and `strcat` are deliberately not provided;
+use the length-bounded variants so a destination buffer cannot be overrun.
 
 ### Comparison (`strcmp.asm`)
 `asm_strcmp`, `asm_strncmp`, `asm_strcasecmp`, `asm_strncasecmp`

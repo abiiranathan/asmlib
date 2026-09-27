@@ -190,14 +190,6 @@ static void test_string(void) {
             CHECK(asm_strlen(s + off) == strlen(s + off), "strlen");
             for (size_t ml = 0; ml <= len + 3; ml += 1 + (ml / 8))
                 CHECK(asm_strnlen(s + off, ml) == strnlen(s + off, ml), "strnlen");
-            memset(d1, 0x7E, sizeof d1); memset(d2, 0x7E, sizeof d2);
-            strcpy(d2 + off, s);
-            CHECK(asm_strcpy(d1 + off, s) == d1 + off, "strcpy-ret");
-            CHECK(memcmp(d1, d2, sizeof d1) == 0, "strcpy");
-            memset(d1, 0x7E, sizeof d1); memset(d2, 0x7E, sizeof d2);
-            CHECK(asm_stpcpy(d1 + off, s) == d1 + off + len, "stpcpy-ret");
-            stpcpy(d2 + off, s);
-            CHECK(memcmp(d1, d2, sizeof d1) == 0, "stpcpy");
             for (size_t n = 0; n <= len + 3 && n < 600; n++) {
                 memset(d1, 0x7E, sizeof d1); memset(d2, 0x7E, sizeof d2);
                 asm_strncpy(d1, s, n);
@@ -212,10 +204,6 @@ static void test_string(void) {
                 strncat(d2, s, n);
                 CHECK(memcmp(d1, d2, 700) == 0, "strncat");
             }
-            memset(d1, 0x55, sizeof d1); memset(d2, 0x55, sizeof d2);
-            strcpy(d1, "pre:"); strcpy(d2, "pre:");
-            asm_strcat(d1, s); strcat(d2, s);
-            CHECK(memcmp(d1, d2, sizeof d1) == 0, "strcat");
         }
     }
 }
@@ -363,13 +351,6 @@ static void test_guards(void) {
         CHECK(NO_FAULT(asm_memset(d, 0xAB, n) == d), "guard memset");
         CHECK(NO_FAULT(asm_memcpy(d, region, n) == d), "guard memcpy");
         CHECK(NO_FAULT(asm_bzero(d, n) == d), "guard bzero");
-        unsigned char *s = region + 16;
-        memset(s, 'x', n); s[n - 1] = 0;
-        /* copy a NUL-terminated string ending at the guard */
-        unsigned char *sd = limit - n;
-        for (size_t i = 0; i + 1 < n; i++) sd[i] = 'q';
-        sd[n - 1] = 0;
-        CHECK(NO_FAULT(asm_strcpy((char *)d, (const char *)sd) == (char *)d), "guard strcpy");
     }
 
     sigaction(SIGSEGV, &old, NULL);

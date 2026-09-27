@@ -5,10 +5,7 @@
 ;
 ;   size_t asm_strlen (const char *s);
 ;   size_t asm_strnlen(const char *s, size_t maxlen);
-;   char  *asm_strcpy (char *dst, const char *src);
-;   char  *asm_stpcpy (char *dst, const char *src);
 ;   char  *asm_strncpy(char *dst, const char *src, size_t n);
-;   char  *asm_strcat (char *dst, const char *src);
 ;   char  *asm_strncat(char *dst, const char *src, size_t n);
 ;
 ; All speculative vector reads are page safe: strlen-style scans align the
@@ -254,81 +251,6 @@ asm_strnlen:
     ret                                 ; return the length in rax
 
 ;==============================================================================
-; char *asm_strcpy(char *dst, const char *src)
-;------------------------------------------------------------------------------
-; Copies src (including its NUL) to dst. Returns dst.
-;
-; Parameters (System V AMD64 ABI):
-;   rdi = dst (char *)        - destination buffer
-;   rsi = src (const char *)  - NUL-terminated source string
-; Returns:
-;   rax = dst
-; Uses / clobbers:
-;   pushes and restores rbx and r12 (callee-saved) and reserves 8 bytes
-;   to keep rsp 16-byte aligned; calls asm_strlen then asm_memcpy; result
-;   in rax.
-;==============================================================================
-global asm_strcpy:function              ; export asm_strcpy as a function symbol
-asm_strcpy:
-    ; ---- prologue: preserve callee-saved registers, align the stack ----
-    push    rbx                         ; preserve callee-saved registers
-    push    r12                         ; save r12 (callee-saved)
-    sub     rsp, 8                      ; realign the stack for calls
-    mov     rbx, rdi                    ; rbx = dst
-    mov     r12, rsi                    ; r12 = src
-    ; ---- call sequence: length, then memcpy of length+1 bytes ----
-    mov     rdi, rsi                    ; first arg to strlen
-    call    asm_strlen                  ; rax = string length
-    lea     rdx, [rax+1]                ; include the terminating NUL
-    mov     rdi, rbx                    ; destination
-    mov     rsi, r12                    ; source
-    call    asm_memcpy                  ; copy length + 1 bytes
-    mov     rax, rbx                    ; return original dst
-    ; ---- epilogue: restore the saved registers and return dst ----
-    add     rsp, 8                      ; undo the stack alignment adjustment
-    pop     r12                         ; restore r12
-    pop     rbx                         ; restore rbx
-    ret                                 ; return rax = dst
-
-;==============================================================================
-; char *asm_stpcpy(char *dst, const char *src)
-;------------------------------------------------------------------------------
-; Copies src (including its NUL) to dst. Returns a pointer to the NUL that
-; terminates the copied string (i.e. dst + strlen(src)).
-;
-; Parameters (System V AMD64 ABI):
-;   rdi = dst (char *)        - destination buffer
-;   rsi = src (const char *)  - NUL-terminated source string
-; Returns:
-;   rax = pointer to the NUL that terminates the copy (dst + strlen(src))
-; Uses / clobbers:
-;   pushes and restores rbx, r12 and r13 (callee-saved); calls asm_strlen
-;   then asm_memcpy; result in rax.
-;==============================================================================
-global asm_stpcpy:function              ; export asm_stpcpy as a function symbol
-asm_stpcpy:
-    ; ---- prologue: preserve callee-saved registers ----
-    push    rbx                         ; preserve callee-saved registers
-    push    r12                         ; save r12 (callee-saved)
-    push    r13                         ; save r13 (callee-saved)
-    mov     rbx, rdi                    ; rbx = dst
-    mov     r12, rsi                    ; r12 = src
-    ; ---- call sequence: length, then memcpy of length+1 bytes ----
-    mov     rdi, rsi                    ; first arg to strlen
-    call    asm_strlen                  ; rax = string length
-    mov     r13, rax                    ; keep the length
-    lea     rdx, [rax+1]                ; include the terminating NUL
-    mov     rdi, rbx                    ; destination
-    mov     rsi, r12                    ; source
-    call    asm_memcpy                  ; copy length + 1 bytes
-    lea     rax, [rbx+r13]              ; return pointer to the new NUL
-    ; ---- epilogue: restore the saved registers and return the NUL pointer ----
-    pop     r13                         ; restore r13
-    pop     r12                         ; restore r12
-    pop     rbx                         ; restore rbx
-    ret                                 ; return rax = pointer to the new NUL
-
-;==============================================================================
 ; char *asm_strncpy(char *dst, const char *src, size_t n)
 ;------------------------------------------------------------------------------
 ; Copies at most n bytes of src. If src is shorter than n, the remainder of
@@ -379,42 +301,6 @@ asm_strncpy:
     add     rsp, 8                      ; undo the stack alignment adjustment
     pop     r14                         ; restore r14
     pop     r13                         ; restore r13
-    pop     r12                         ; restore r12
-    pop     rbx                         ; restore rbx
-    ret                                 ; return rax = dst
-
-;==============================================================================
-; char *asm_strcat(char *dst, const char *src)
-;------------------------------------------------------------------------------
-; Appends src (including its NUL) to the end of dst. Returns dst.
-;
-; Parameters (System V AMD64 ABI):
-;   rdi = dst (char *)        - NUL-terminated destination string
-;   rsi = src (const char *)  - NUL-terminated string to append
-; Returns:
-;   rax = dst
-; Uses / clobbers:
-;   pushes and restores rbx and r12 (callee-saved) and reserves 8 bytes
-;   to keep rsp 16-byte aligned; calls asm_strlen then asm_strcpy; result
-;   in rax.
-;==============================================================================
-global asm_strcat:function              ; export asm_strcat as a function symbol
-asm_strcat:
-    ; ---- prologue: preserve callee-saved registers, align the stack ----
-    push    rbx                         ; preserve callee-saved registers
-    push    r12                         ; save r12 (callee-saved)
-    sub     rsp, 8                      ; realign the stack for calls
-    mov     rbx, rdi                    ; rbx = dst
-    mov     r12, rsi                    ; r12 = src
-    ; ---- call sequence: find the end of dst, then append src ----
-    mov     rdi, rbx                    ; first arg to strlen
-    call    asm_strlen                  ; rax = strlen(dst)
-    lea     rdi, [rbx+rax]              ; destination = end of dst
-    mov     rsi, r12                    ; source
-    call    asm_strcpy                  ; append src (with NUL)
-    mov     rax, rbx                    ; return dst
-    ; ---- epilogue: restore the saved registers and return dst ----
-    add     rsp, 8                      ; undo the stack alignment adjustment
     pop     r12                         ; restore r12
     pop     rbx                         ; restore rbx
     ret                                 ; return rax = dst

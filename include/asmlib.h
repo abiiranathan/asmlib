@@ -83,19 +83,14 @@ size_t asm_strlen(const char* s);
 /* Length of s, but never reads past s + maxlen. */
 size_t asm_strnlen(const char* s, size_t maxlen);
 
-/* Copy src (including NUL) to dst. Returns dst. */
-char* asm_strcpy(char* dst, const char* src);
-
-/* Copy src (including NUL) to dst. Returns a pointer to the new NUL. */
-char* asm_stpcpy(char* dst, const char* src);
-
-/* Copy at most n bytes of src, NUL-padding the remainder. Returns dst. */
+/* Copy at most n bytes of src, NUL-padding the remainder. Returns dst.
+ * The number of bytes written is bounded by n; unlike asm_strcpy (removed),
+ * this can never copy an unbounded amount into dst. */
 char* asm_strncpy(char* dst, const char* src, size_t n);
 
-/* Append src (including NUL) to dst. Returns dst. */
-char* asm_strcat(char* dst, const char* src);
-
-/* Append at most n bytes of src, then NUL-terminate. Returns dst. */
+/* Append at most n bytes of src, then NUL-terminate. Returns dst.
+ * The number of bytes appended is bounded by n; unlike asm_strcat (removed),
+ * this can never append an unbounded amount into dst. */
 char* asm_strncat(char* dst, const char* src, size_t n);
 
 /*==============================================================================
@@ -291,10 +286,7 @@ void asm_free(void* ptr);
 #define memrchr     asm_memrchr
 #define strlen      asm_strlen
 #define strnlen     asm_strnlen
-#define strcpy      asm_strcpy
-#define stpcpy      asm_stpcpy
 #define strncpy     asm_strncpy
-#define strcat      asm_strcat
 #define strncat     asm_strncat
 #define strcmp      asm_strcmp
 #define strncmp     asm_strncmp
