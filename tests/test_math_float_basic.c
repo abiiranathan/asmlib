@@ -57,7 +57,14 @@ static void eqf(const char *what, float x, float got, float want)
 
 static void ulf(const char *what, float x, float got, float want, uint64_t maxu)
 {
-    mt_cmp(what, (double)x, (double)got, (double)want, maxu);
+    /* got and want are already floats, but the host libm function returns a
+     * value that may be promoted to double with extra precision on some
+     * targets (e.g. when contracted). Round both to float first, then compare
+     * with the double-ULP metric, so the distance is measured in binary32
+     * ulps rather than in the binary64 grid the promotions live on. */
+    float g = (float)got;
+    float w = (float)want;
+    mt_cmp(what, (double)x, (double)g, (double)w, maxu);
 }
 
 #define E1(fn, x)          eqf(#fn, (x), ASM_MATH(fn)(x), fn(x))
