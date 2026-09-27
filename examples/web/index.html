@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asmlib · double pendulum (WebAssembly)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #0b0e14; color: #c9d1d9; display: flex; min-height: 100vh;
+  }
+  #stage { flex: 1 1 auto; display: grid; place-items: center; padding: 24px; }
+  canvas { background: #0f1420; border: 1px solid #223; border-radius: 12px; }
+  aside { width: 320px; padding: 24px; border-left: 1px solid #1b2130; background:#0d1119; }
+  h1 { font-size: 15px; margin: 0 0 4px; color: #e6edf3; }
+  h1 small { color: #6b7686; font-weight: normal; }
+  .row { display: flex; justify-content: space-between; margin: 6px 0; }
+  .row span:first-child { color: #7d8798; }
+  .val { color: #79c0ff; }
+  button {
+    font: inherit; padding: 8px 12px; margin: 4px 4px 4px 0;
+    background: #1f6feb; color: white; border: 0; border-radius: 6px; cursor: pointer;
+  }
+  button.secondary { background: #21262d; color: #c9d1d9; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=range] { width: 100%; }
+  fieldset { border: 1px solid #1b2130; border-radius: 8px; margin: 16px 0; padding: 10px 12px; }
+  legend { color: #7d8798; padding: 0 6px; }
+  #status { margin-top: 12px; font-size: 12px; color: #6b7686; min-height: 3em; }
+  #status.err { color: #ff7b72; }
+  #metrics { font-size: 12px; }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="view" width="640" height="640"></canvas></div>
+  <aside>
+    <h1>asmlib <small>wasm double pendulum</small></h1>
+    <p style="color:#7d8798;margin:4px 0 16px;font-size:12px">
+      All <code>sin/cos/fabs</code> and <code>malloc</code> calls run in our
+      freestanding WebAssembly module — the browser supplies nothing.
+    </p>
+
+    <fieldset>
+      <legend>controls</legend>
+      <div class="row"><span>θ₁</span><span class="val" id="t1v">90°</span></div>
+      <input type="range" id="t1" min="-180" max="180" value="90" step="1">
+      <div class="row"><span>θ₂</span><span class="val" id="t2v">90°</span></div>
+      <input type="range" id="t2" min="-180" max="180" value="90" step="1">
+      <div class="row"><span>speed</span><span class="val" id="spv">1.0×</span></div>
+      <input type="range" id="sp" min="0.1" max="5" value="1" step="0.1">
+      <div style="margin-top:10px">
+        <button id="reset">reset</button>
+        <button id="pause" class="secondary">pause</button>
+        <button id="trace" class="secondary">trace: on</button>
+      </div>
+    </fieldset>
+
+    <fieldset id="metrics">
+      <legend>live state</legend>
+      <div class="row"><span>step</span><span class="val" id="m_step">0</span></div>
+      <div class="row"><span>sim time</span><span class="val" id="m_time">0.00 s</span></div>
+      <div class="row"><span>energy drift</span><span class="val" id="m_drift">0</span></div>
+      <div class="row"><span>ω₁</span><span class="val" id="m_w1">0</span></div>
+      <div class="row"><span>ω₂</span><span class="val" id="m_w2">0</span></div>
+      <div class="row"><span>fps</span><span class="val" id="m_fps">0</span></div>
+    </fieldset>
+
+    <div id="status">loading module…</div>
+  </aside>
+
+<script>
+"use strict";
+
+const DT = 0.0005;            // RK4 step (s), must match the C DT
+const STEPS_PER_FRAME = 16;   // 8 ms of sim per animation frame at 1×
+
+const els = {
+  canvas: document.getElementById("view"),
+  t1: document.getElementById("t1"), t2: document.getElementById("t2"),
+  sp: document.getElementById("sp"),
+  reset: document.getElementById("reset"), pause: document.getElementById("pause"),
+  trace: document.getElementById("trace"), status: document.getElementById("status"),
+};
+const ctx = els.canvas.getContext("2d");
+
+async function boot() {
+  const res = await fetch("double_pendulum.wasm");
+  if (!res.ok) throw new Error(`fetch double_pendulum.wasm: ${res.status}`);
+  const bytes = await res.arrayBuffer();
+  const mod = new WebAssembly.Module(bytes);
+  const imports = WebAssembly.Module.imports(mod);
+  if (imports.length !== 0)
+    throw new Error(`module must be freestanding, has ${imports.length} imports`);
+  const wasm = new WebAssembly.Instance(mod, {}).exports;
+
+  // Typed views over the module's own linear memory.
+  const mem = () => wasm.memory.buffer;
+  const f64 = () => new Float64Array(mem());
+
+  // A rolling trace buffer for the second bob.
+  const TRACE = 3000;
+  const traceBuf = wasm.dp_buffer(TRACE);   // 2*TRACE doubles, ours forever
+  let traceHead = 0, traceLen = 0;
+
+  let running = true, showTrace = true, steps = 0, frames = 0, lastFps = performance.now();
+
+  function reset() {
+    const t1 = (+els.t1.value) * Math.PI / 180;
+    const t2 = (+els.t2.value) * Math.PI / 180;
+    wasm.dp_init(t1, t2);
+    steps = 0; traceHead = 0; traceLen = 0;
+    draw();
+  }
+
+  function pushTrace(x, y) {
+    const b = f64();
+    const base = traceBuf >> 3;               // byte pointer -> double index
+    b[base + 2 * traceHead] = x;
+    b[base + 2 * traceHead + 1] = y;
+    traceHead = (traceHead + 1) % TRACE;
+    if (traceLen < TRACE) traceLen++;
+  }
+
+  const P = 0.9;                              // metres per 100 px scaling
+  function toPx(x, y) {
+    const cx = els.canvas.width / 2, cy = els.canvas.height * 0.42;
+    const s = els.canvas.width / (2 * 2.2);   // arm reach ~2 m -> fit canvas
+    return [cx + x * s, cy - y * s];
+  }
+
+  function draw() {
+    const [th1, w1, th2, w2] = Array.from(f64().slice(wasm.dp_state() >> 3,
+                                                      (wasm.dp_state() >> 3) + 4));
+    const x1 = Math.sin(th1), y1 = -Math.cos(th1);
+    const x2 = x1 + Math.sin(th2), y2 = y1 - Math.cos(th2);
+
+    ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+
+    // pivot + arm-length reference circle
+    const [px, py] = toPx(0, 0);
+    const s = els.canvas.width / (2 * 2.2);
+    ctx.strokeStyle = "#1b2130"; ctx.beginPath();
+    ctx.arc(px, py, 2 * s, 0, Math.PI * 2); ctx.stroke();
+
+    // trace of bob 2
+    if (showTrace && traceLen > 1) {
+      const b = f64(), base = traceBuf >> 3;
+      ctx.strokeStyle = "rgba(121,192,255,0.35)"; ctx.beginPath();
+      for (let i = 0; i < traceLen; i++) {
+        const idx = (traceHead - traceLen + i + TRACE) % TRACE;
+        const [qx, qy] = toPx(b[base + 2 * idx], b[base + 2 * idx + 1]);
+        i ? ctx.lineTo(qx, qy) : ctx.moveTo(qx, qy);
+      }
+      ctx.stroke();
+    }
+
+    // rods
+    const [ax, ay] = toPx(x1, y1), [bx, by] = toPx(x2, y2);
+    ctx.lineWidth = 3; ctx.strokeStyle = "#8b949e";
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    // bobs
+    ctx.fillStyle = "#e6edf3";
+    for (const [cx, cy, r] of [[px, py, 5], [ax, ay, 8], [bx, by, 10]]) {
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function tick() {
+    if (running) {
+      const mult = +els.sp.value;
+      const n = Math.max(1, Math.round(STEPS_PER_FRAME * mult));
+      wasm.dp_step(n);
+      steps += n;
+      const b = f64();
+      pushTrace(wasm.dp_tip_x(), wasm.dp_tip_y());
+      draw();
+
+      const st = f64(), si = wasm.dp_state() >> 3;
+      document.getElementById("m_step").textContent = steps.toLocaleString();
+      document.getElementById("m_time").textContent = (steps * DT).toFixed(2) + " s";
+      document.getElementById("m_drift").textContent = wasm.dp_energy_drift().toExponential(2);
+      document.getElementById("m_w1").textContent = st[si + 1].toFixed(3);
+      document.getElementById("m_w2").textContent = st[si + 3].toFixed(3);
+    }
+
+    frames++;
+    const now = performance.now();
+    if (now - lastFps > 500) {
+      document.getElementById("m_fps").textContent = (frames / ((now - lastFps) / 1000)).toFixed(0);
+      frames = 0; lastFps = now;
+    }
+    requestAnimationFrame(tick);
+  }
+
+  // wiring
+  els.t1.addEventListener("input", () => { document.getElementById("t1v").textContent = els.t1.value + "°"; reset(); });
+  els.t2.addEventListener("input", () => { document.getElementById("t2v").textContent = els.t2.value + "°"; reset(); });
+  els.sp.addEventListener("input", () => { document.getElementById("spv").textContent = (+els.sp.value).toFixed(1) + "×"; });
+  els.reset.addEventListener("click", reset);
+  els.pause.addEventListener("click", () => {
+    running = !running;
+    els.pause.textContent = running ? "pause" : "resume";
+  });
+  els.trace.addEventListener("click", () => {
+    showTrace = !showTrace;
+    els.trace.textContent = "trace: " + (showTrace ? "on" : "off");
+  });
+
+  els.status.textContent =
+    `module: ${bytes.byteLength.toLocaleString()} bytes, ${imports.length} imports — ready`;
+  reset();
+  requestAnimationFrame(tick);
+}
+
+boot().catch(err => {
+  els.status.className = "err";
+  els.status.textContent = "ERROR: " + err.message +
+    "\nServe the folder over HTTP (e.g. `make wasm-serve`) — browsers block " +
+    "module fetch from file://";
+  console.error(err);
+});
+</script>
+</body>
+</html>

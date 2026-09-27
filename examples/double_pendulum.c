@@ -29,14 +29,17 @@
 
 #include <stddef.h>
 
-/* On a hosted build we use the system <math.h>. In the freestanding wasm
- * build there is no <math.h>: asmlib *is* the math library, so we include its
- * header with ASMLIB_MATH_STD_NAMES, which declares sin/cos/sqrt/fabs (and the
- * float variants) under the standard names the code below uses. */
+/* On a hosted build we use the system <math.h> and <stdlib.h>. In the
+ * freestanding wasm build there is no libc: asmlib *is* the math library and
+ * its portable backend is the libc, so we include the asmlib headers with the
+ * standard-name macros defined, which declare sin/cos/sqrt/fabs and
+ * malloc/free under the standard names the code below uses. */
 #ifdef ASMLIB_MATH_STD_NAMES
 #include "asmlib_math.h"
+#include "portable.h"
 #else
 #include <math.h>
+#include <stdlib.h>
 #endif
 
 #define G   9.81
@@ -96,15 +99,20 @@ static void rk4(state *s, double h)
 }
 
 /*------------------------------------------------------------------------------
- * Exported entry points. The wasm build exports every symbol; the JS driver
- * calls these. `samples` is the number of RK4 steps to run (== number of
- * (x,y) frames produced). The trajectory is written into a caller-provided
- * buffer of 2*samples doubles: x = l1 sin th1 + l2 sin th2,
- * y = -(l1 cos th1 + l2 cos th2) (origin at the pivot, y up).
+ * Library API. These are the only symbols the web UI needs; the module is
+ * linked with an explicit export list (see the Makefile) rather than
+ * --export-all, so this is a clean C ABI:
  *
- * Returns the accumulated energy drift in ulps-ish units (how faithfully the
- * integrator conserved energy), a single scalar that is very sensitive to any
- * error in the math or memory routines.
+ *   dp_init(th1, th2)              reset the pendulum to rest at (th1, th2)
+ *   dp_step(n)                     advance n RK4 steps (DT seconds each)
+ *   dp_state()                     -> pointer to {th1, w1, th2, w2}
+ *   dp_tip_x() / dp_tip_y()        current tip position (metres)
+ *   dp_energy_drift()              relative energy change since dp_init
+ *   dp_buffer(n)                   -> pointer to 2*n doubles for a trajectory
+ *   dp_run(th1, th2, n, out)       batch: fill out with n frames, return drift
+ *
+ * The simulation state is a single file-scope struct, so the UI can step it
+ * one frame at a time and draw. All math goes through the asmlib wasm module.
  *------------------------------------------------------------------------------
  * float32 version: the same physics in single precision, to also exercise the
  * float math backend.
@@ -124,25 +132,67 @@ static double energy(const state *s)
     return ke + pe;
 }
 
-double double_pendulum_run(double th1, double th2, long samples, double *out)
-{
-    state s;
-    s.th1 = th1;
-    s.w1  = 0.0;
-    s.th2 = th2;
-    s.w2  = 0.0;
+/* ---- persistent simulation state ---------------------------------------- */
+static state  g_s;
+static double g_e0;                            /* energy at the last dp_init   */
 
-    double e0 = energy(&s);
-    for (long i = 0; i < samples; i++) {
-        rk4(&s, DT);
-        out[2 * i + 0] = L1 * sin(s.th1) + L2 * sin(s.th2);
-        out[2 * i + 1] = -(L1 * cos(s.th1) + L2 * cos(s.th2));
-    }
-    double e1 = energy(&s);
-    return fabs((e1 - e0) / e0);               /* relative energy drift        */
+double *dp_state(void)        { return (double *)&g_s; }
+double  dp_tip_x(void)        { return L1 * sin(g_s.th1) + L2 * sin(g_s.th2); }
+double  dp_tip_y(void)        { return -(L1 * cos(g_s.th1) + L2 * cos(g_s.th2)); }
+double  dp_energy_drift(void) { return fabs((energy(&g_s) - g_e0) / g_e0); }
+
+void dp_init(double th1, double th2)
+{
+    g_s.th1 = th1; g_s.w1 = 0.0;
+    g_s.th2 = th2; g_s.w2 = 0.0;
+    g_e0 = energy(&g_s);
 }
 
-/* Single-precision variant using the float math backend. */
+/* Advance the persistent state by n RK4 steps. Returns the energy drift. */
+double dp_step(long n)
+{
+    for (long i = 0; i < n; i++)
+        rk4(&g_s, DT);
+    return dp_energy_drift();
+}
+
+/* A reusable trajectory buffer (2*n doubles) that the UI can hand to the
+ * module and read back without allocating every frame. `n` may grow it. */
+static double *g_buf;
+static long    g_bufcap;
+
+double *dp_buffer(long n)
+{
+    if (n > g_bufcap) {
+        free(g_buf);
+        g_buf = (double *)malloc((size_t)n * 2u * sizeof(double));
+        g_bufcap = g_buf ? n : 0;
+    }
+    return g_buf;
+}
+
+/* Batch run from a fresh state into a caller-supplied buffer (kept for the
+ * command-line cross-check and the native comparison). */
+double dp_run(double th1, double th2, long samples, double *out)
+{
+    dp_init(th1, th2);
+    for (long i = 0; i < samples; i++) {
+        rk4(&g_s, DT);
+        out[2 * i + 0] = L1 * sin(g_s.th1) + L2 * sin(g_s.th2);
+        out[2 * i + 1] = -(L1 * cos(g_s.th1) + L2 * cos(g_s.th2));
+    }
+    return dp_energy_drift();
+}
+
+/* Keep the older name used by the Node smoke test as an alias. */
+double double_pendulum_run(double th1, double th2, long samples, double *out)
+{
+    return dp_run(th1, th2, samples, out);
+}
+
+/* Single-precision batch path (exercises the float math backend). If `out` is
+ * non-NULL it receives 2*samples (x,y) frames; it may be NULL if the caller
+ * only wants the returned final angular speed. */
 float double_pendulum_run_f(float th1, float th2, long samples, float *out)
 {
     float g = 9.81f, l1 = 1.0f, l2 = 1.0f, m1 = 1.0f, m2 = 1.0f, h = 0.0005f;
@@ -161,8 +211,10 @@ float double_pendulum_run_f(float th1, float th2, long samples, float *out)
                      / den2;
         w1 += h * acc1; w2 += h * acc2;
         a1 += h * w1;   a2 += h * w2;
-        out[2 * i + 0] = l1 * sinf(a1) + l2 * sinf(a2);
-        out[2 * i + 1] = -(l1 * cosf(a1) + l2 * cosf(a2));
+        if (out) {
+            out[2 * i + 0] = l1 * sinf(a1) + l2 * sinf(a2);
+            out[2 * i + 1] = -(l1 * cosf(a1) + l2 * cosf(a2));
+        }
     }
     return sqrtf(w1 * w1 + w2 * w2);           /* final angular speed          */
 }

@@ -80,7 +80,9 @@ make test-libc  # run the portable (wasm) memory/string/allocator tests
 make test-mt    # run the multithreaded allocator stress tests
 make bench-math # benchmark the math library against the host libm
 make wasm       # build the freestanding wasm32 module (math + portable libc)
-make wasm-example   # build + run the double-pendulum wasm demo in Node
+make wasm-lib   # build the double-pendulum library module (clean C ABI)
+make wasm-serve # serve the browser double-pendulum UI on :8000
+make wasm-example   # non-interactive check of the pendulum library module
 make clean
 ```
 
@@ -523,31 +525,45 @@ $ make example
 
 ### Double-pendulum WebAssembly demo
 
-`examples/double_pendulum.c` + `examples/double_pendulum.js` are a real-world
-end-to-end test: a chaotic double pendulum integrated with RK4, compiled to
-`wasm32` and run in Node with asmlib supplying **both** the math (`sin`, `cos`,
-`fabs`) and, through the portable backend, the runtime — the module has no
-imports. `make wasm-example` builds `build/double_pendulum.wasm` and runs it:
+`examples/double_pendulum.c` is built as a **library** module and driven from a
+browser UI rather than a script. It integrates a chaotic double pendulum with
+RK4 and exposes a small C ABI — `dp_init`, `dp_step`, `dp_state`, `dp_tip_x`,
+`dp_tip_y`, `dp_energy_drift`, `dp_buffer` — exported explicitly (no
+`--export-all`), while the module supplies all its math (`sin`, `cos`, `fabs`)
+and, through the portable backend, `malloc`/`free`. There are **no imports**:
+the browser provides nothing.
+
+```sh
+make wasm-lib     # build examples/web/double_pendulum.wasm (a clean ABI)
+make wasm-serve   # serve examples/web/ at http://localhost:8000
+```
+
+`examples/web/index.html` is a self-contained page (canvas + controls) that
+loads the module, steps the simulation once per animation frame through
+`dp_step`, and draws the rods, bobs and a fading trace. The UI shows live
+energy drift and angular velocities — a visible, real-world check that the
+library's math and memory routines are correct under continuous use.
+
+For a non-interactive check of the same ABI, `make wasm-example` runs
+`examples/double_pendulum.js`:
 
 ```
 $ make wasm-example
-== asmlib wasm double-pendulum example ==
-  module          : 56759 bytes, 0 imports
-  samples         : 200000 steps (100.0 s of motion)
-  wall time       : 194.8 ms  (1.0M steps/s)
-  energy drift    : 6.319e-9 %
+== asmlib wasm double-pendulum library ==
+  module          : 13207 bytes, 0 imports
+  samples         : 200000 steps (100.0 s)
+  wall time       : 264.8 ms  (0.8M steps/s)
+  energy drift    : 6.319e-11
   tip x range     : [-1.9919, 2.0000]
   tip y range     : [-1.9996, 0.4828]
   max reach       : 2.0000 m (bound 2 m)
-  f32 final speed : 5.5722 rad/s
-OK: double pendulum conserved energy and stayed physical
+OK: library ABI conserved energy and stayed physical
 ```
 
-The driver checks four things that would expose a broken math or memory
-routine: the module is import-free, the RK4 integrator conserves energy to
-~1e-9 relative, the tip never leaves the 2 m arm reach, and the single-
-precision path stays finite. The same source builds natively (host libm) for
-cross-checking.
+The driver checks the module is import-free, the RK4 integrator conserves
+energy to ~1e-9 relative, the tip never leaves the 2 m arm reach, and the
+single-precision path stays finite. The same source builds natively (host
+libm) for cross-checking.
 
 ## Freestanding and portability
 

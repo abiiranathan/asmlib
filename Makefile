@@ -46,7 +46,7 @@ MATH_BENCH_BIN  := $(BUILD)/math_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm wasm-example
+.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm wasm-lib wasm-example wasm-serve
 
 all: $(STATIC) $(SHARED)
 
@@ -198,22 +198,42 @@ wasm:
 	fi
 
 # Real-world wasm demo: a double pendulum integrated with asmlib as the
-# freestanding math + libc, linked with the library objects into one module and
-# run from Node (examples/double_pendulum.js).
+# freestanding math + libc. `make wasm-lib` links it as a *library* module with
+# a small explicit C ABI (no --export-all) ready to be loaded from a web page.
 WASM_EX_OBJ := $(BUILD)/wasm/double_pendulum.o
-WASM_EX     := $(BUILD)/double_pendulum.wasm
+WASM_LIB    := $(BUILD)/double_pendulum.wasm
+WEB_DIR     := examples/web
+WEB_WASM    := $(WEB_DIR)/double_pendulum.wasm
 
-wasm-example:
+# Symbols the web UI needs: the pendulum API plus malloc/free so JS can read
+# the trajectory buffer. Everything else stays private to the module.
+WASM_EXPORTS := dp_init dp_step dp_state dp_tip_x dp_tip_y dp_energy_drift \
+                dp_buffer dp_run double_pendulum_run_f malloc free
+
+wasm-lib:
 	@rm -rf $(BUILD)/wasm
 	@mkdir -p $(BUILD)/wasm
 	@for f in $(MATH_SRC) $(LIBC_SRC); do \
 		o=$(BUILD)/wasm/$$(basename $$f .c).o; \
 		$(WASM_CC) $(MATH_CFLAGS) -Isrc/libc -DASMLIB_MATH_STD_NAMES -DASMLIB_LIBC_STD_NAMES -c -o $$o $$f || exit 1; \
 	done
-	$(WASM_CC) $(MATH_CFLAGS) -DASMLIB_MATH_STD_NAMES -c -o $(WASM_EX_OBJ) examples/double_pendulum.c
-	wasm-ld --no-entry --export-all -o $(WASM_EX) $(BUILD)/wasm/*.o
-	@echo "linked $(WASM_EX)"
-	node examples/double_pendulum.js
+	$(WASM_CC) $(MATH_CFLAGS) -DASMLIB_MATH_STD_NAMES -DASMLIB_LIBC_STD_NAMES -Iinclude -Isrc/libc -c -o $(WASM_EX_OBJ) examples/double_pendulum.c
+	wasm-ld --no-entry --export-memory --initial-memory=1048576 --max-memory=67108864 \
+		$(foreach s,$(WASM_EXPORTS),--export=$(s)) \
+		-o $(WASM_LIB) $(BUILD)/wasm/*.o
+	@echo "linked $(WASM_LIB) (library module, $(words $(WASM_EXPORTS)) exports)"
+	@mkdir -p $(WEB_DIR)
+	cp $(WASM_LIB) $(WEB_WASM)
+	@echo "copied to $(WEB_WASM)"
+
+# Serve the web UI over HTTP (browsers block wasm fetch from file://).
+wasm-serve: wasm-lib
+	@echo "open http://localhost:8000/  (Ctrl-C to stop)"
+	@cd $(WEB_DIR) && python3 -m http.server 8000
+
+# Non-interactive check of the library module's C ABI, from Node.
+wasm-example: wasm-lib
+	node examples/double_pendulum.js $(WASM_LIB)
 
 clean:
 	rm -rf $(BUILD)

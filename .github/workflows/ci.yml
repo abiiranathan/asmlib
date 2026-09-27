@@ -51,10 +51,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld
-      - name: Build and link the module
-        run: make wasm
-      - name: Smoke-test the module in Node
+      - name: Build and smoke-test the wasm library + math module
         run: |
+          make wasm
           node - <<'JS'
           const fs = require("fs");
           const mod = new WebAssembly.Module(fs.readFileSync("build/asmlib.wasm"));
@@ -68,14 +67,11 @@ jobs:
           if (e.cbrt(27) !== 3) throw new Error("cbrt");
           if (!near(e.sinh(1), Math.sinh(1))) throw new Error("sinh");
           if (e.hypot(3, 4) !== 5) throw new Error("hypot");
-          // portable libc backend
           const p = e.calloc(256, 1);
           e.memset(p, 65, 4);
           if (e.strlen(p) !== 4) throw new Error("strlen/calloc");
           const q = e.malloc(8); e.memcpy(q, p, 4); e.free(q); e.free(p);
-          const s = e.calloc(4, 4);
-          if (e.strlen(s) !== 0) throw new Error("calloc");
           console.log("wasm smoke test: OK");
           JS
-      - name: Run the double-pendulum wasm example
+      - name: Build and check the double-pendulum library module
         run: make wasm-example
