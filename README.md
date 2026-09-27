@@ -1,5 +1,7 @@
 # asmlib — a high-performance x86-64 assembly replacement for libc string/memory routines
 
+[![CI](https://github.com/abiiranathan/asmlib/actions/workflows/ci.yml/badge.svg)](https://github.com/abiiranathan/asmlib/actions/workflows/ci.yml)
+
 `asmlib` is a hand-written NASM library for x86-64 (System V AMD64 ABI) that
 replaces the hottest C library memory and string functions with AVX2/BMI2
 implementations. It is small, self-contained (no dependencies beyond the
@@ -505,4 +507,6 @@ unchanged.
 
 ## License
 
-Provided as-is for use and modification. No warranty.
+MIT — see [`LICENSE`](LICENSE). Portions of `src/math/` are adapted from musl
+libc and carry their own MIT notice in [`src/math/NOTICE`](src/math/NOTICE).
+Provided as-is, without warranty.

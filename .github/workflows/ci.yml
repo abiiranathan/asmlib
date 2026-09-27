@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: build & test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+      - name: Build asm library
+        run: make CC=${{ matrix.cc }}
+      - name: Differential tests
+        run: make CC=${{ matrix.cc }} test
+      - name: Math differential tests
+        run: make CC=${{ matrix.cc }} test-math
+      - name: AddressSanitizer + UBSan
+        run: make CC=${{ matrix.cc }} test-asan
+
+  valgrind:
+    name: valgrind memcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm valgrind
+      - name: memcheck
+        run: make test-valgrind
+
+  wasm:
+    name: wasm32 build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+      - name: Build and link the math module
+        run: make wasm
+      - name: Smoke-test the module in Node
+        run: |
+          node - <<'JS'
+          const fs = require("fs");
+          const mod = new WebAssembly.Module(fs.readFileSync("build/asmlib_math.wasm"));
+          if (WebAssembly.Module.imports(mod).length !== 0)
+            throw new Error("module must be freestanding (no imports)");
+          const e = new WebAssembly.Instance(mod, {}).exports;
+          const near = (a, b) => Math.abs(a - b) <= 1e-14 * Math.max(1, Math.abs(b));
+          if (!near(e.exp(1), Math.E)) throw new Error("exp");
+          if (!near(e.log(2), Math.LN2)) throw new Error("log");
+          if (e.pow(2, 10) !== 1024) throw new Error("pow");
+          if (e.cbrt(27) !== 3) throw new Error("cbrt");
+          if (!near(e.sinh(1), Math.sinh(1))) throw new Error("sinh");
+          if (e.hypot(3, 4) !== 5) throw new Error("hypot");
+          console.log("wasm smoke test: OK");
+          JS

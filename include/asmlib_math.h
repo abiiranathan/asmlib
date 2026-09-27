@@ -1,6 +1,8 @@
 /*==============================================================================
  * asmlib_math.h - freestanding double-precision math library
  *------------------------------------------------------------------------------
+ * SPDX-License-Identifier: MIT
+ *
  * A libc-free, WebAssembly-friendly reimplementation of the C <math.h>
  * double-precision surface. It has no external dependencies: no libc, no
  * libm, no errno, no floating-point environment and no global state. It is

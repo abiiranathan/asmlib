@@ -1,6 +1,8 @@
 /*==============================================================================
  * asmlib.h - public C interface to the x86-64 NASM assembly library
  *------------------------------------------------------------------------------
+ * SPDX-License-Identifier: MIT
+ *
  * A drop-in, high-performance replacement for the hottest libc memory and
  * string routines, implemented in hand-written AVX2/BMI2 assembly.
  *
