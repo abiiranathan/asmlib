@@ -247,6 +247,12 @@ asm_memmem:
 ;==============================================================================
 global asm_strstr:function
 asm_strstr:
+    movzx   eax, byte [rsi]             ; needle[0]
+    test    al, al                      ; empty needle?
+    jz      .empty                      ; yes: match at hay
+    movzx   ecx, byte [rsi+1]           ; needle[1]
+    test    cl, cl                      ; one-character needle?
+    jz      .one                        ; yes: strchr needs no strlen(hay)
     push    rbx                         ; preserve callee-saved registers
     push    r12
     push    r13
@@ -265,6 +271,12 @@ asm_strstr:
     pop     r12
     pop     rbx
     ret
+.empty:
+    mov     rax, rdi                    ; empty needle matches at hay
+    ret
+.one:
+    movzx   esi, byte [rsi]             ; single byte: a plain strchr is optimal
+    jmp     asm_strchr                  ; tail call (rdi is already hay)
 
 ;==============================================================================
 ; Internal helper: build the 256-byte membership table used by the span

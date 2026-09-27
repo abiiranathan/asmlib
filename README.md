@@ -132,10 +132,16 @@ Predicates return `1` for true and `0` for false.
   wider load against page crossing. `memcmp` unrolls eight 32-byte vectors
   per iteration (all 16 YMM registers) and folds the equality masks with a
   `vpand` tree before a single `vpmovmskb`.
+* **Case-insensitive compares.** `strcasecmp`/`strncasecmp` fold 32 bytes at
+  a time with AVX2 (`vpsubb`/`vpminub`/`vpcmpeqb`/`vpand`/`vpor`), and
+  amortise the page-safety check over the whole run of full vectors that
+  stays inside the current page instead of testing every iteration.
 * **Searching.** `memmem`/`strstr` make a single pass over 32-byte aligned
   blocks, matching the first **two** needle bytes with two vector compares so
   only genuine two-byte candidates reach the full `memcmp`. A final scalar
-  check covers the last byte of each block.
+  check covers the last byte of each block. `strstr` special-cases a
+  one-byte needle to `strchr`, so it never computes `strlen(haystack)` when a
+  match can be found immediately.
 * **Accept sets.** `strspn`/`strcspn`/`strpbrk` build a 256-byte membership
   table on the stack, so scanning is a single linear pass.
 * **Cache behaviour.** `memset` uses ERMS `rep stosb` for fills of 4 KiB or
@@ -147,11 +153,13 @@ Predicates return `1` for true and `0` for false.
 
 `strlen` reduces eight aligned vectors per iteration with a `vpminub` tree
 (4 ALU ops per 128 bytes instead of 7), `memcmp` and `memcpy` unroll to 256
-bytes, and small `memchr`/`memcmp` sizes use overlapping page-safe vector
-windows rather than byte loops. Against glibc the results are now broadly
-comparable: memory routines are at or near parity for medium and large sizes,
-`memchr` is typically faster, and string scans are within roughly 1.5-2x of
-glibc's highly tuned `strstr`.
+bytes, `strcasecmp` folds 32 bytes per AVX2 step, and small
+`memchr`/`memcmp` sizes use overlapping page-safe vector windows rather than
+byte loops. Against glibc the memory routines are at or near parity, `memchr`
+is consistently faster, `memmem` is several times faster than libc's, and the
+case-insensitive compares went from 20-50x slower to parity for short strings
+and about 0.5-0.8x for long ones. `strstr` (which glibc implements with a
+dedicated two-way algorithm) is within roughly 0.6-0.8x.
 
 ## Testing
 

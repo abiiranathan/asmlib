@@ -346,6 +346,15 @@ static void test_guards(void) {
         CHECK(NO_FAULT(asm_memcmp(s, s, L + 1) == 0), "guard memcmp");
         /* strstr with a needle that is not present */
         CHECK(NO_FAULT(asm_strstr((char *)s, "zz") == NULL), "guard strstr");
+        /* case-insensitive compare against a mixed-case duplicate */
+        {
+            unsigned char *t = region + 16;
+            for (size_t i = 0; i < L; i++) t[i] = (unsigned char)('A' + (i % 5));
+            t[L] = 0;
+            CHECK(NO_FAULT(asm_strcasecmp((char *)s, (char *)t) == 0), "guard strcasecmp");
+            CHECK(NO_FAULT(asm_strncasecmp((char *)s, (char *)t, L) == 0), "guard strncasecmp");
+            CHECK(NO_FAULT(asm_strncasecmp((char *)s, (char *)t, L + 1) == 0), "guard strncasecmp2");
+        }
     }
 
     /* ---- writes ending exactly at the guard -----------------------------*/

@@ -33,6 +33,16 @@ default rel
     or      %1, r8d                     ; set the lower-case bit if uppercase
 %endmacro
 
+; Vector lower-casing of a 256-bit register for the case-insensitive compares.
+; %1 = data (in/out); %2, %3 = scratch. Requires ymm14='A', ymm15=25, ymm13=0x20.
+%macro ASM_FOLD_LOWER_YMM 3
+    vpsubb  %2, %1, ymm14               ; t = c - 'A' (wraps for c < 'A')
+    vpminub %3, %2, ymm15               ; u = min(t, 25)
+    vpcmpeqb %3, %3, %2                 ; 0xFF where t <= 25 (upper case)
+    vpand   %3, %3, ymm13               ; mask = 0x20 where upper case
+    vpor    %1, %1, %3                  ; set the lower-case bit
+%endmacro
+
 section .text
 
 ;==============================================================================
@@ -192,49 +202,209 @@ asm_strncmp:
 ; int asm_strcasecmp(const char *a, const char *b)
 ;------------------------------------------------------------------------------
 ; Case-insensitive (C/POSIX locale) comparison of two NUL-terminated strings.
+; Uses 32-byte AVX2 folding so long strings are handled 32 bytes per step.
 ;==============================================================================
 global asm_strcasecmp:function
 asm_strcasecmp:
+    mov     eax, 0x41414141             ; 'A' broadcast constant
+    vmovd   xmm14, eax
+    vpbroadcastb ymm14, xmm14
+    mov     eax, 0x19191919             ; 25 broadcast constant
+    vmovd   xmm15, eax
+    vpbroadcastb ymm15, xmm15
+    mov     eax, 0x20202020             ; 0x20 broadcast constant
+    vmovd   xmm13, eax
+    vpbroadcastb ymm13, xmm13
+    vpxor   ymm12, ymm12, ymm12         ; zero constant
 .loop:
-    movzx   eax, byte [rdi]             ; byte of a
-    movzx   ecx, byte [rsi]             ; byte of b
-    ASM_FOLD_LOWER eax                  ; lower-case a
-    ASM_FOLD_LOWER ecx                  ; lower-case b
-    sub     eax, ecx                    ; folded comparison
-    jnz     .ret                        ; differing: return
+    mov     eax, edi                    ; bytes from a to its page end
+    and     eax, PAGE_SIZE-1
+    mov     ecx, PAGE_SIZE
+    sub     ecx, eax
+    mov     eax, esi                    ; bytes from b to its page end
+    and     eax, PAGE_SIZE-1
+    mov     r9d, PAGE_SIZE
+    sub     r9d, eax
+    cmp     ecx, r9d                    ; ecx = min bytes safely readable
+    cmova   ecx, r9d
+    cmp     ecx, 32
+    jb      .byte                       ; fewer than 32 safe bytes: scalar step
+    shr     ecx, 5                      ; number of safe 32-byte iterations
+.inner:
+    vmovdqu ymm0, [rdi]                 ; load 32 bytes of a
+    vmovdqu ymm1, [rsi]                 ; load 32 bytes of b
+    ASM_FOLD_LOWER_YMM ymm0, ymm2, ymm3 ; lower-case a
+    ASM_FOLD_LOWER_YMM ymm1, ymm4, ymm5 ; lower-case b
+    vpcmpeqb ymm6, ymm0, ymm1           ; per-byte equality
+    vpmovmskb eax, ymm6                 ; equality mask
+    cmp     eax, -1                     ; all 32 folded bytes equal?
+    jne     .diff                       ; no: locate the difference
+    vpcmpeqb ymm7, ymm0, ymm12          ; NUL bytes in a (folded keeps NUL)
+    vpmovmskb r9d, ymm7
+    test    r9d, r9d
+    jnz     .equal                      ; both ended together
+    add     rdi, 32                     ; advance
+    add     rsi, 32
+    dec     ecx                         ; one fewer safe iteration
+    jnz     .inner
+    jmp     .loop                       ; recompute the page-safe window
+.diff:
+    not     eax                         ; positions that differ
+    tzcnt   eax, eax                    ; first differing bit
+    vpcmpeqb ymm7, ymm0, ymm12          ; is there a NUL before the difference?
+    vpmovmskb ecx, ymm7
+    test    ecx, ecx
+    jz      .emit
+    tzcnt   ecx, ecx
+    cmp     ecx, eax
+    jb      .equal                      ; NUL earlier: strings were equal
+.emit:
+    movzx   ecx, byte [rdi+rax]         ; folded scalar comparison
+    movzx   edx, byte [rsi+rax]
+    ASM_FOLD_LOWER ecx
+    ASM_FOLD_LOWER edx
+    mov     eax, ecx
+    sub     eax, edx
+    vzeroupper
+    ret
+.equal:
+    vzeroupper
+    xor     eax, eax
+    ret
+.byte:
+    movzx   eax, byte [rdi]             ; scalar step (page boundary / tail)
+    movzx   ecx, byte [rsi]
+    ASM_FOLD_LOWER eax
+    ASM_FOLD_LOWER ecx
+    sub     eax, ecx
+    jnz     .byte_ret
     test    ecx, ecx                    ; both folded to NUL?
-    jz      .ret                        ; yes: equal (eax is 0)
-    inc     rdi                         ; advance
+    jz      .byte_eq
+    inc     rdi
     inc     rsi
     jmp     .loop
-.ret:
+.byte_eq:
+    xor     eax, eax
+.byte_ret:
+    vzeroupper
     ret
 
 ;==============================================================================
 ; int asm_strncasecmp(const char *a, const char *b, size_t n)
 ;------------------------------------------------------------------------------
-; Case-insensitive comparison of at most n bytes.
+; Case-insensitive comparison of at most n bytes, 32 bytes per vector step.
 ;==============================================================================
 global asm_strncasecmp:function
 asm_strncasecmp:
     test    rdx, rdx                    ; n == 0?
     jz      .equal                      ; yes: treated as equal
+    mov     eax, 0x41414141             ; 'A' broadcast constant
+    vmovd   xmm14, eax
+    vpbroadcastb ymm14, xmm14
+    mov     eax, 0x19191919             ; 25 broadcast constant
+    vmovd   xmm15, eax
+    vpbroadcastb ymm15, xmm15
+    mov     eax, 0x20202020             ; 0x20 broadcast constant
+    vmovd   xmm13, eax
+    vpbroadcastb ymm13, xmm13
+    vpxor   ymm12, ymm12, ymm12         ; zero constant
 .loop:
-    movzx   eax, byte [rdi]             ; byte of a
-    movzx   ecx, byte [rsi]             ; byte of b
-    ASM_FOLD_LOWER eax                  ; lower-case a
-    ASM_FOLD_LOWER ecx                  ; lower-case b
-    sub     eax, ecx                    ; folded comparison
-    jnz     .ret                        ; differing: return
-    test    ecx, ecx                    ; NUL reached?
-    jz      .equal                      ; yes: equal so far
-    inc     rdi                         ; advance
-    inc     rsi
-    dec     rdx                         ; consume one byte of the budget
+    cmp     rdx, 32                     ; at least 32 bytes of budget left?
+    jb      .bytes_tight                ; no: finish with a scalar loop
+    mov     eax, edi                    ; bytes from a to its page end
+    and     eax, PAGE_SIZE-1
+    mov     ecx, PAGE_SIZE
+    sub     ecx, eax
+    mov     eax, esi                    ; bytes from b to its page end
+    and     eax, PAGE_SIZE-1
+    mov     r9d, PAGE_SIZE
+    sub     r9d, eax
+    cmp     ecx, r9d                    ; ecx = min bytes safely readable
+    cmova   ecx, r9d
+    cmp     ecx, 32
+    jb      .page_step                  ; < 32 safe bytes: one scalar byte
+    shr     ecx, 5                      ; safe 32-byte iterations
+    mov     r9, rdx
+    shr     r9, 5                       ; budget iterations
+    cmp     ecx, r9d                    ; ecx = min(page safe, budget)
+    cmova   ecx, r9d
+    mov     r10d, ecx                   ; remember how many we will run
+.inner:
+    vmovdqu ymm0, [rdi]                 ; load 32 bytes of a
+    vmovdqu ymm1, [rsi]                 ; load 32 bytes of b
+    ASM_FOLD_LOWER_YMM ymm0, ymm2, ymm3
+    ASM_FOLD_LOWER_YMM ymm1, ymm4, ymm5
+    vpcmpeqb ymm6, ymm0, ymm1           ; per-byte equality
+    vpmovmskb eax, ymm6
+    cmp     eax, -1
+    jne     .diff
+    vpcmpeqb ymm7, ymm0, ymm12          ; NUL reached?
+    vpmovmskb r9d, ymm7
+    test    r9d, r9d
+    jnz     .equal
+    add     rdi, 32
+    add     rsi, 32
+    dec     ecx
+    jnz     .inner
+    shl     r10, 5                      ; bytes consumed by the inner loop
+    sub     rdx, r10                    ; consume the budget
     jnz     .loop
+    jmp     .equal
+.diff:
+    not     eax
+    tzcnt   eax, eax
+    vpcmpeqb ymm7, ymm0, ymm12
+    vpmovmskb ecx, ymm7
+    test    ecx, ecx
+    jz      .emit
+    tzcnt   ecx, ecx
+    cmp     ecx, eax
+    jb      .equal
+.emit:
+    movzx   ecx, byte [rdi+rax]
+    movzx   edx, byte [rsi+rax]
+    ASM_FOLD_LOWER ecx
+    ASM_FOLD_LOWER edx
+    mov     eax, ecx
+    sub     eax, edx
+    vzeroupper
+    ret
+.page_step:
+    movzx   eax, byte [rdi]             ; one scalar byte, then recheck pages
+    movzx   ecx, byte [rsi]
+    ASM_FOLD_LOWER eax
+    ASM_FOLD_LOWER ecx
+    sub     eax, ecx
+    jnz     .byte_ret
+    test    ecx, ecx                    ; NUL reached?
+    jz      .equal
+    inc     rdi
+    inc     rsi
+    dec     rdx
+    jnz     .loop
+    jmp     .equal
+.bytes_tight:
+    test    rdx, rdx                    ; budget exhausted?
+    jz      .equal
+.byte_loop:
+    movzx   eax, byte [rdi]             ; tight scalar loop for the last <32
+    movzx   ecx, byte [rsi]
+    ASM_FOLD_LOWER eax
+    ASM_FOLD_LOWER ecx
+    sub     eax, ecx
+    jnz     .byte_ret
+    test    ecx, ecx                    ; NUL reached?
+    jz      .equal
+    inc     rdi
+    inc     rsi
+    dec     rdx
+    jnz     .byte_loop
 .equal:
+    vzeroupper
     xor     eax, eax
-.ret:
+    ret
+.byte_ret:
+    vzeroupper
     ret
 
 GNU_STACK_NOTE
