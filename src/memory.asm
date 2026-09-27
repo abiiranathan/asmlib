@@ -39,8 +39,10 @@ section .text
 global asm_memcpy:function
 asm_memcpy:
     mov     rax, rdi                    ; rax = dst (return value)
-    cmp     rdx, 1<<21                  ; 2 MiB or more?
-    jae     .nt_copy                    ; yes: consider non-temporal stores
+    cmp     rdx, 262144                 ; 256 KiB (L2-sized) or more?
+    jae     .nt_copy                    ; yes: non-temporal stores win
+    cmp     rdx, 98304                  ; 96 KiB..255 KiB?
+    jae     .erms_copy                  ; yes: ERMS rep movsb is fastest
     cmp     rdx, 32                     ; n >= 32 bytes?
     jae     .ge32                       ; yes: enter vectorised path
     cmp     rdx, 16                     ; 16 <= n < 32?
@@ -83,7 +85,7 @@ asm_memcpy:
     ; ---- very large copies: non-temporal stores avoid read-for-ownership ---
 .nt_copy:
     test    dil, 31                     ; is the destination 32-byte aligned?
-    jnz     .ge32                       ; no: vmovntdq would fault, use normal
+    jnz     .erms_copy                  ; no: fall back to ERMS for this size
     mov     rcx, rdx                    ; rcx = n
     and     rcx, -128                   ; rcx = n rounded down to 128
     xor     r8d, r8d                    ; r8 = running offset
@@ -110,6 +112,13 @@ asm_memcpy:
     vmovdqu [rdi+rdx-64], ymm2
     vmovdqu [rdi+rdx-32], ymm3
     vzeroupper
+    ret
+    ; ---- n in [96 KiB, 256 KiB): single rep movsb is fastest on this CPU ----
+.erms_copy:
+    cld                                 ; rep moves forward (DF clear)
+    mov     rcx, rdx                    ; rcx = n
+.erms_loop:
+    rep     movsb                       ; dst=rdi, src=rsi, count=rcx
     ret
 .ge32:
     cmp     rdx, 64                     ; 32 <= n <= 64?

@@ -40,20 +40,45 @@ asm_strchr:
     vmovd   xmm0, esi                   ; move c into an xmm lane
     vpbroadcastb ymm0, xmm0             ; broadcast c across the vector
     vpxor   ymm2, ymm2, ymm2            ; ymm2 = all zero
-    mov     rax, rdi                    ; rax = current pointer
-    ; ---- reach a 32-byte aligned address with a short scalar prologue
-.align:
-    test    al, 31                      ; already 32-byte aligned?
-    jz      .aligned                    ; yes: use aligned vector loads
-    movzx   ecx, byte [rax]             ; load one byte
-    cmp     cl, sil                     ; equal to c?
-    je      .found                      ; yes: report it
-    test    cl, cl                      ; NUL (end of string)?
-    jz      .notfound                   ; yes: c is absent
-    inc     rax                         ; advance one byte
-    jmp     .align
-.aligned:
-    vmovdqa ymm1, [rax]                 ; aligned, page-safe load
+    mov     ecx, edi                    ; ecx = s (for the offset)
+    and     rdi, -32                    ; rdi = aligned block base (page safe)
+    and     ecx, 31                     ; ecx = bytes before s in this block
+    jz      .main                       ; s is aligned: straight to the scan
+    ; ---- head block: bytes before s are masked off with a shift ----------
+    vmovdqa ymm1, [rdi]                 ; aligned, page-safe load
+    vpcmpeqb ymm3, ymm1, ymm0           ; bytes equal to c
+    vpcmpeqb ymm4, ymm1, ymm2           ; NUL bytes
+    vpmovmskb r8d, ymm3                 ; c mask (relative to the block)
+    vpmovmskb r9d, ymm4                 ; NUL mask
+    shr     r8d, cl                     ; drop bytes before s
+    shr     r9d, cl
+    add     rdi, rcx                    ; rdi = s
+    test    r8d, r8d                    ; any c match at/after s?
+    jz      .head_no_c                  ; no: continue unless a NUL ends s
+    test    r9d, r9d                    ; any NUL at/after s?
+    jz      .head_hit                   ; no: the c match is valid
+    tzcnt   r8d, r8d                    ; both present: whichever is earlier
+    tzcnt   r9d, r9d                    ; wins (c == 0 lands here too)
+    cmp     r8d, r9d
+    ja      .notfound                   ; NUL precedes c: c is absent
+    add     rdi, r8                     ; result = s + position
+    mov     rax, rdi
+    vzeroupper
+    ret
+.head_hit:
+    tzcnt   r8d, r8d                    ; position of the first c at/after s
+    add     rdi, r8                     ; result = s + position
+    mov     rax, rdi
+    vzeroupper
+    ret
+.head_no_c:
+    test    r9d, r9d                    ; NUL in the head (at/after s)?
+    jnz     .notfound                   ; yes: c is absent
+.head_tail:
+    add     rdi, 32                     ; next block (base was s - offset)
+    and     rdi, -32                    ; restore the aligned base
+.main:
+    vmovdqa ymm1, [rdi]                 ; aligned, page-safe load
     vpcmpeqb ymm3, ymm1, ymm0           ; bytes equal to c
     vpcmpeqb ymm4, ymm1, ymm2           ; NUL bytes
     vpmovmskb ecx, ymm3                 ; match mask for c
@@ -62,8 +87,8 @@ asm_strchr:
     jnz     .candidate                  ; yes: compare positions
     test    edx, edx                    ; any NUL?
     jnz     .notfound                   ; NUL with no c: c is absent
-    add     rax, 32                     ; advance to the next block
-    jmp     .aligned
+    add     rdi, 32                     ; advance to the next block
+    jmp     .main
 .candidate:
     tzcnt   r8d, ecx                    ; position of the first c match
     test    edx, edx                    ; is there a NUL in the block?
@@ -73,8 +98,9 @@ asm_strchr:
     jbe     .found_c                    ; yes: valid (c == 0 lands here too)
     jmp     .notfound                   ; NUL precedes c: c is absent
 .found_c:
-    add     rax, r8                     ; combine base and offset
+    add     rdi, r8                     ; combine base and offset
 .found:
+    mov     rax, rdi
     vzeroupper
     ret
 .notfound:

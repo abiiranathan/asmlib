@@ -49,153 +49,165 @@ section .text
 ; int asm_strcmp(const char *a, const char *b)
 ;------------------------------------------------------------------------------
 ; Returns 0 if equal, otherwise the sign of the first differing byte pair.
+; Bytes are compared in 32-byte AVX2 windows that are guaranteed to stay
+; inside the current page; the tail near a page end is stepped bytewise.
 ;==============================================================================
 global asm_strcmp:function
 asm_strcmp:
-    mov     r10, 0x0101010101010101     ; SWAR "low bit" constant
-    mov     r11, 0x8080808080808080     ; SWAR "high bit" constant
-.qloop:
-    ; ---- page-safety gate: both pointers must allow an 8-byte read
-    mov     eax, edi                    ; eax = low 12 bits of a
+    vpxor   ymm12, ymm12, ymm12         ; ymm12 = zero (NUL detection)
+.loop:
+    ; ---- how many full vectors can both pointers still read in-page?
+    mov     eax, edi
     and     eax, PAGE_SIZE-1
-    cmp     eax, PAGE_SIZE-8            ; would the read cross the page end?
-    ja      .byte                       ; yes: fall back to a byte step
-    mov     eax, esi                    ; eax = low 12 bits of b
+    mov     ecx, PAGE_SIZE
+    sub     ecx, eax                    ; ecx = a's remaining page bytes
+    mov     eax, esi
     and     eax, PAGE_SIZE-1
-    cmp     eax, PAGE_SIZE-8
-    ja      .byte
-    ; ---- compare 8 bytes at a time
-    mov     rax, [rdi]                  ; load 8 bytes of a
-    mov     rcx, [rsi]                  ; load 8 bytes of b
-    cmp     rax, rcx                    ; identical chunk?
-    jne     .diff                       ; no: locate the differing byte
-    ; ---- equal chunk: is there a NUL byte (in both, since they are equal)?
-    mov     rdx, rax                    ; copy chunk
-    sub     rdx, r10                    ; x - 0x01..01
-    not     rax                         ; ~x
-    and     rdx, rax                    ; (x-1) & ~x
-    and     rdx, r11                    ; mask the high bits
-    test    rdx, rdx                    ; any zero byte?
-    jnz     .equal                      ; yes: both strings end here
-    add     rdi, 8                      ; advance to the next chunk
-    add     rsi, 8
-    jmp     .qloop
+    mov     r9d, PAGE_SIZE
+    sub     r9d, eax                    ; r9d = b's remaining page bytes
+    cmp     ecx, r9d
+    cmova   ecx, r9d                    ; ecx = min of the two
+    cmp     ecx, 32
+    jb      .byte                       ; < 32 safe bytes: scalar step
+    shr     ecx, 5                      ; ecx = number of safe vectors
+.inner:
+    vmovdqu ymm0, [rdi]                 ; 32 bytes of a
+    vmovdqu ymm1, [rsi]                 ; 32 bytes of b
+    vpcmpeqb ymm2, ymm0, ymm1           ; per-byte equality
+    vpmovmskb eax, ymm2
+    cmp     eax, -1                     ; all 32 bytes equal?
+    jne     .diff
+    vpcmpeqb ymm3, ymm0, ymm12          ; NUL bytes in a (and b)
+    vpmovmskb r9d, ymm3
+    test    r9d, r9d
+    jnz     .equal                      ; both strings end here
+    add     rdi, 32
+    add     rsi, 32
+    dec     ecx
+    jnz     .inner
+    jmp     .loop                       ; recompute the page window
 .diff:
-    mov     rdx, rax                    ; copy a's chunk
-    xor     rdx, rcx                    ; bit positions that differ
-    tzcnt   rdx, rdx                    ; lowest differing bit
-    ; ---- check for a NUL in a that occurs before the difference
-    mov     r8, rax                     ; copy a's chunk
-    sub     r8, r10
-    not     rax
-    and     r8, rax
-    and     r8, r11                     ; zero-byte flags of a
-    test    r8, r8
+    not     eax                         ; positions that differ
+    tzcnt   eax, eax                    ; byte index of the first difference
+    vpcmpeqb ymm3, ymm0, ymm12          ; NUL positions in a
+    vpmovmskb ecx, ymm3
+    test    ecx, ecx
     jz      .emit                       ; no NUL before the difference
-    tzcnt   r8, r8                      ; bit of the first NUL
-    cmp     r8, rdx                     ; NUL earlier than the difference?
-    jb      .equal                      ; yes: the strings ended equally
+    tzcnt   ecx, ecx
+    cmp     ecx, eax                    ; NUL earlier than the difference?
+    jb      .equal                      ; yes: strings were equal
 .emit:
-    shr     rdx, 3                      ; convert bit index to byte index
-    movzx   eax, byte [rdi+rdx]         ; differing byte of a
-    movzx   ecx, byte [rsi+rdx]         ; differing byte of b
-    sub     eax, ecx                    ; signed result
+    movzx   ecx, byte [rdi+rax]         ; first differing bytes
+    movzx   edx, byte [rsi+rax]
+    mov     eax, ecx
+    sub     eax, edx
+    vzeroupper
     ret
 .equal:
-    xor     eax, eax                    ; strings are equal
+    vzeroupper
+    xor     eax, eax
     ret
 .byte:
-    movzx   eax, byte [rdi]             ; load one byte of a
-    movzx   ecx, byte [rsi]             ; load one byte of b
-    sub     eax, ecx                    ; compare
-    jnz     .ret                        ; differing: done
-    test    cl, cl                      ; both NUL (they were equal)?
-    jz      .equal                      ; yes: equal
-    inc     rdi                         ; advance one byte
+    movzx   eax, byte [rdi]             ; scalar step near a page end
+    movzx   ecx, byte [rsi]
+    sub     eax, ecx
+    jnz     .byte_ret
+    test    cl, cl                      ; both NUL?
+    jz      .byte_eq
+    inc     rdi
     inc     rsi
-    jmp     .qloop                      ; retry the fast path
-.ret:
+    jmp     .loop
+.byte_eq:
+    xor     eax, eax
+.byte_ret:
+    vzeroupper
     ret
 
 ;==============================================================================
 ; int asm_strncmp(const char *a, const char *b, size_t n)
 ;------------------------------------------------------------------------------
-; Compares at most n bytes. Returns 0 if the first n bytes are equal.
+; Compares at most n bytes. Returns 0 if the first n bytes are equal. The
+; inner loop runs min(page-safe vectors, remaining vectors) at a time.
 ;==============================================================================
 global asm_strncmp:function
 asm_strncmp:
-    mov     r8, 0x0101010101010101      ; SWAR "low bit" constant
-    mov     r9, 0x8080808080808080      ; SWAR "high bit" constant
+    vpxor   ymm12, ymm12, ymm12         ; ymm12 = zero (NUL detection)
 .loop:
-    cmp     rdx, 8                      ; at least 8 bytes left?
-    jb      .bytes                      ; no: finish with a byte loop
-    ; ---- page-safety gate for an 8-byte read from both pointers
-    mov     r10d, edi
-    and     r10d, PAGE_SIZE-1
-    cmp     r10d, PAGE_SIZE-8
-    ja      .bytes
-    mov     r10d, esi
-    and     r10d, PAGE_SIZE-1
-    cmp     r10d, PAGE_SIZE-8
-    ja      .bytes
-    ; ---- compare one 8-byte chunk
-    mov     rax, [rdi]                  ; chunk of a
-    mov     rcx, [rsi]                  ; chunk of b
-    cmp     rax, rcx
-    jne     .diff                       ; differ: locate the byte
-    ; ---- equal chunk: check for a NUL byte
-    mov     r10, rax
-    sub     r10, r8
-    mov     r11, rax
-    not     r11
-    and     r10, r11
-    and     r10, r9
-    test    r10, r10
-    jnz     .equal                      ; NUL reached before n bytes
-    add     rdi, 8
-    add     rsi, 8
-    sub     rdx, 8
-    jmp     .loop
+    cmp     rdx, 32                     ; at least a full vector of budget?
+    jb      .bytes                      ; no: scalar loop
+    mov     eax, edi
+    and     eax, PAGE_SIZE-1
+    mov     ecx, PAGE_SIZE
+    sub     ecx, eax                    ; a's page window
+    mov     eax, esi
+    and     eax, PAGE_SIZE-1
+    mov     r9d, PAGE_SIZE
+    sub     r9d, eax                    ; b's page window
+    cmp     ecx, r9d
+    cmova   ecx, r9d                    ; ecx = min page window
+    cmp     ecx, 32
+    jb      .bytes
+    mov     r9, rdx                     ; ctx = budget vectors
+    shr     r9, 5
+    cmp     ecx, r9d
+    cmova   ecx, r9d                    ; ecx = min(page vectors, budget vectors)
+    mov     r10d, ecx                   ; remember the count for the budget
+.inner:
+    vmovdqu ymm0, [rdi]
+    vmovdqu ymm1, [rsi]
+    vpcmpeqb ymm2, ymm0, ymm1
+    vpmovmskb eax, ymm2
+    cmp     eax, -1
+    jne     .diff
+    vpcmpeqb ymm3, ymm0, ymm12
+    vpmovmskb r9d, ymm3
+    test    r9d, r9d
+    jnz     .equal                      ; NUL reached before the budget
+    add     rdi, 32
+    add     rsi, 32
+    dec     ecx
+    jnz     .inner
+    shl     r10, 5                      ; bytes compared by the inner loop
+    sub     rdx, r10                    ; consume the budget
+    jnz     .loop
+    jmp     .equal
 .diff:
-    mov     r10, rax                    ; copy a's chunk
-    xor     r10, rcx                    ; differing bits
-    tzcnt   r10, r10                    ; lowest differing bit
-    ; ---- look for a NUL in a before that bit
-    mov     r11, rax
-    sub     r11, r8
-    not     rax
-    and     r11, rax
-    and     r11, r9
-    test    r11, r11
+    not     eax
+    tzcnt   eax, eax                    ; byte index of the first difference
+    vpcmpeqb ymm3, ymm0, ymm12
+    vpmovmskb ecx, ymm3
+    test    ecx, ecx
     jz      .emit
-    tzcnt   r11, r11
-    cmp     r11, r10                    ; NUL before the difference?
+    tzcnt   ecx, ecx
+    cmp     ecx, eax
     jb      .equal
 .emit:
-    shr     r10, 3                      ; bit index -> byte index
-    movzx   eax, byte [rdi+r10]
-    movzx   ecx, byte [rsi+r10]
-    sub     eax, ecx
+    movzx   ecx, byte [rdi+rax]
+    movzx   edx, byte [rsi+rax]
+    mov     eax, ecx
+    sub     eax, edx
+    vzeroupper
     ret
 .equal:
+    vzeroupper
     xor     eax, eax
     ret
 .bytes:
     test    rdx, rdx                    ; no bytes left?
     jz      .equal
 .byte_loop:
-    movzx   eax, byte [rdi]             ; load a byte of a
-    movzx   ecx, byte [rsi]             ; load a byte of b
-    sub     eax, ecx                    ; compare
-    jnz     .ret                        ; differing: done
-    test    cl, cl                      ; NUL reached?
-    jz      .equal                      ; yes: equal so far
+    movzx   eax, byte [rdi]
+    movzx   ecx, byte [rsi]
+    sub     eax, ecx
+    jnz     .byte_ret
+    test    cl, cl
+    jz      .equal
     inc     rdi
     inc     rsi
-    dec     rdx                         ; one fewer byte allowed
+    dec     rdx
     jnz     .byte_loop
     jmp     .equal
-.ret:
+.byte_ret:
     ret
 
 ;==============================================================================

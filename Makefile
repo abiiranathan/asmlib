@@ -26,9 +26,10 @@ TEST_ARENA_BIN:= $(BUILD)/test_arena
 TEST_ALLOC_BIN:= $(BUILD)/test_alloc
 BENCH_BIN     := $(BUILD)/bench
 BENCH_ARENA_BIN := $(BUILD)/bench_arena
+PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan bench bench-arena bench-alloc example clean
+.PHONY: all test test-valgrind test-asan bench bench-arena bench-alloc perfbench example clean
 
 all: $(STATIC) $(SHARED)
 
@@ -96,6 +97,16 @@ bench-arena: $(BENCH_ARENA_BIN)
 
 bench-alloc: $(BENCH_ARENA_BIN)
 	./$(BENCH_ARENA_BIN)
+
+# One-phase-per-invocation harness for profiling with `perf`:
+#   perf record -o /tmp/p.data ./build/perfbench <phase> [reps]
+# Phases: memcpy memcpy1k memset memset1k memcmp strlen strchr memchr
+#         memchr_scan strchr_scan strcmp memmem arena_alloc malloc_free
+$(PERF_BIN): bench/perfbench.c $(STATIC) $(HEADER)
+	$(CC) $(CFLAGS) -o $@ bench/perfbench.c $(STATIC) $(LDFLAGS)
+
+perfbench: $(PERF_BIN)
+	@echo "usage: perf record ./build/perfbench <phase> [reps]"
 
 # ---- practical example ------------------------------------------------------
 $(EX_BIN): examples/example.c $(STATIC) $(HEADER)

@@ -204,9 +204,11 @@ asm_free(buf);
   page and otherwise falls back to single 32-byte vectors. Bounded operations
   (`strnlen`, `memchr`, `memmem`, …) only read fully-contained blocks before a
   scalar finish.
-* **Comparison tricks.** `strcmp`/`strncmp` use SWAR zero-byte detection and
-  `tzcnt` to find the first difference without a byte loop, guarding the
-  wider load against page crossing. `memcmp` unrolls eight 32-byte vectors
+* **Comparison tricks.** `strcmp`/`strncmp` compare 32 bytes per AVX2 step
+  inside a page-crossing-safe window, detecting the NUL and the first
+  difference with two vector compares and `tzcnt` (3.7-5x faster than the
+  SWAR byte-loop they replaced, and faster than glibc's two-way `strcmp`).
+  `memcmp` unrolls eight 32-byte vectors
   per iteration (all 16 YMM registers) and folds the equality masks with a
   `vpand` tree before a single `vpmovmskb`.
 * **Case-insensitive compares.** `strcasecmp`/`strncasecmp` fold 32 bytes at
@@ -222,9 +224,17 @@ asm_free(buf);
 * **Accept sets.** `strspn`/`strcspn`/`strpbrk` build a 256-byte membership
   table on the stack, so scanning is a single linear pass.
 * **Cache behaviour.** `memset` uses ERMS `rep stosb` for fills of 4 KiB or
-  more, and `memcpy` uses non-temporal stores (with an `sfence`) for copies
-  of 2 MiB or more when the destination is 32-byte aligned, avoiding
-  read-for-ownership traffic.
+  more, and `memcpy` picks the copy engine by size — plain 256-byte AVX2
+  below 96 KiB, ERMS `rep movsb` from 96 to 256 KiB, and non-temporal
+  128-byte stores (with an `sfence`) above 256 KiB when the destination is
+  32-byte aligned. Those thresholds (and the NT block size) were chosen from
+  measurements on the target CPU: plain copies saturate the cache hierarchy
+  up to L2, ERMS wins in the L3 range, and streaming stores avoid
+  read-for-ownership traffic once both buffers exceed it.
+* **`strchr` aligns down.** Instead of walking to a 32-byte boundary one byte
+  at a time, the head block is loaded from the aligned address below `s` and
+  the bytes before `s` are masked off with a shift — the same trick `strlen`
+  uses, so unaligned strings cost one vector instead of up to 31 scalar steps.
 * **Arena.** Chunks carry a 48-byte header (backing pointer, chain link,
   usable capacity, backing size, data pointer); allocations bump a pointer
   and round the size up to 16 bytes. Growing keeps the caller's allocator, so
@@ -324,6 +334,24 @@ The arena wins because allocation is a pointer bump, the memory is contiguous
 per-class free lists are a couple of instructions. The trade-offs — the arena
 reclaims in bulk or to a mark, and the malloc heap is single-threaded and
 retains small-class runs — are the usual ones for these designs.
+
+### Profiling with perf
+
+`make perfbench` builds `bench/perfbench.c`, a harness that runs **one
+operation per invocation** so `perf` attribution is unambiguous:
+
+```sh
+perf record -o /tmp/p.data ./build/perfbench strcmp 100000
+perf report -i /tmp/p.data --no-children --sort=symbol --stdio
+perf stat    -e task-clock,cycles,instructions ./build/perfbench memcpy 100000
+```
+
+That harness drove the latest round of tuning: it showed `strcmp`'s 8-byte
+SWAR loop at 0.69 cycles/byte (4.6x slower than glibc), `memmem` spending 21%
+of its scan in the scalar last-byte check, and `strchr` burning 44% of a
+short scan stepping to alignment. The first two and the third led to the
+AVX2 `strcmp`, the ERMS/NT `memcpy` geometry, and the align-down `strchr`
+respectively.
 
 ## Example
 
