@@ -55,16 +55,33 @@ static void eqf(const char *what, float x, float got, float want)
     mt_check(ok, what, (double)x, (double)got, (double)want, 0);
 }
 
+/* Binary32 total ordering and ULP distance. Comparing two floats through the
+ * binary64 metric (mt_ulp) is wrong: a one-float-ulp difference is ~2^29
+ * binary64 ulps, and an out-of-range tolerance would hide real errors. */
+static MT_UNUSED uint32_t f32_ord(float x)
+{
+    uint32_t u = fbits(x);
+    return (u & 0x80000000u) ? ~u + 1u : u | 0x80000000u;
+}
+
+static MT_UNUSED uint64_t f32_ulp(float a, float b)
+{
+    if (isnan(a) && isnan(b))
+        return 0;
+    if (isnan(a) || isnan(b))
+        return UINT64_MAX / 2;
+    if (a == b)
+        return 0;                                   /* handles +/-0, inf */
+    uint32_t oa = f32_ord(a), ob = f32_ord(b);
+    return oa > ob ? (uint64_t)(oa - ob) : (uint64_t)(ob - oa);
+}
+
 static void ulf(const char *what, float x, float got, float want, uint64_t maxu)
 {
-    /* got and want are already floats, but the host libm function returns a
-     * value that may be promoted to double with extra precision on some
-     * targets (e.g. when contracted). Round both to float first, then compare
-     * with the double-ULP metric, so the distance is measured in binary32
-     * ulps rather than in the binary64 grid the promotions live on. */
-    float g = (float)got;
-    float w = (float)want;
-    mt_cmp(what, (double)x, (double)g, (double)w, maxu);
+    uint64_t u = f32_ulp(got, want);
+    /* Pass the true binary32 ULP distance to the reporter while still showing
+     * the operands; mt_check records it for the max-ULP summary. */
+    mt_check(u <= maxu, what, (double)x, (double)got, (double)want, u);
 }
 
 #define E1(fn, x)          eqf(#fn, (x), ASM_MATH(fn)(x), fn(x))
