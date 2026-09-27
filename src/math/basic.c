@@ -9,6 +9,16 @@
 
 #include "math_private.h"
 
+/* Use the target's native rounding instruction where one exists: SSE4.1
+ * roundsd on x86-64 (guaranteed by the library's AVX2 requirement) and
+ * f64.floor/ceil/trunc/nearest on wasm. Otherwise fall back to the bit-exact
+ * integer manipulation below. */
+#if defined(__wasm__) || defined(__SSE4_1__) || defined(__aarch64__)
+#define ASMLIB_MATH_FAST_ROUND 1
+#else
+#define ASMLIB_MATH_FAST_ROUND 0
+#endif
+
 /*==============================================================================
  * static double pow2i(int k)
  *------------------------------------------------------------------------------
@@ -202,6 +212,9 @@ double ASM_MATH(fdim)(double x, double y)
  *============================================================================*/
 double ASM_MATH(floor)(double x)
 {
+#if ASMLIB_MATH_FAST_ROUND
+    return __builtin_floor(x);                      /* roundsd / f64.floor */
+#else
     /* ---- exponent split: raw bits and unbiased exponent ---- */
     uint64_t i = f64_bits(x);                       /* raw IEEE-754 bits */
     int e = (int)((i >> 52) & 0x7ff) - 1023;        /* unbiased exponent */
@@ -227,6 +240,7 @@ double ASM_MATH(floor)(double x)
     else
         i &= ~mask;                                 /* positive: toward 0 */
     return f64_from_bits(i);
+#endif
 }
 
 /*==============================================================================
@@ -249,6 +263,9 @@ double ASM_MATH(floor)(double x)
  *============================================================================*/
 double ASM_MATH(ceil)(double x)
 {
+#if ASMLIB_MATH_FAST_ROUND
+    return __builtin_ceil(x);                       /* roundsd / f64.ceil */
+#else
     /* ---- exponent split: raw bits and unbiased exponent ---- */
     uint64_t i = f64_bits(x);                       /* raw IEEE-754 bits */
     int e = (int)((i >> 52) & 0x7ff) - 1023;        /* unbiased exponent */
@@ -274,6 +291,7 @@ double ASM_MATH(ceil)(double x)
     else
         i = (i & ~mask) + (mask + 1);               /* positive: away from 0 */
     return f64_from_bits(i);
+#endif
 }
 
 /*==============================================================================
@@ -294,6 +312,9 @@ double ASM_MATH(ceil)(double x)
  *============================================================================*/
 double ASM_MATH(trunc)(double x)
 {
+#if ASMLIB_MATH_FAST_ROUND
+    return __builtin_trunc(x);                      /* roundsd / f64.trunc */
+#else
     /* ---- exponent split: raw bits and unbiased exponent ---- */
     uint64_t i = f64_bits(x);                       /* raw IEEE-754 bits */
     int e = (int)((i >> 52) & 0x7ff) - 1023;        /* unbiased exponent */
@@ -305,6 +326,7 @@ double ASM_MATH(trunc)(double x)
         return f64_from_bits(i & F64_SIGN);         /* +/-0, sign preserved */
     /* ---- drop the fractional mantissa bits (always toward zero) ---- */
     return f64_from_bits(i & ~(F64_MANT >> e));
+#endif
 }
 
 /*==============================================================================
@@ -375,6 +397,9 @@ double ASM_MATH(round)(double x)
  *============================================================================*/
 double ASM_MATH(rint)(double x)
 {
+#if ASMLIB_MATH_FAST_ROUND
+    return __builtin_rint(x);                       /* roundsd / f64.nearest */
+#else
     /* ---- exponent split: raw bits and unbiased exponent ---- */
     uint64_t i = f64_bits(x);                       /* raw IEEE-754 bits */
     int e = (int)((i >> 52) & 0x7ff) - 1023;        /* unbiased exponent */
@@ -412,6 +437,7 @@ double ASM_MATH(rint)(double x)
         i = base;
     }
     return f64_from_bits(i);
+#endif
 }
 
 /*==============================================================================
@@ -457,148 +483,6 @@ double ASM_MATH(nearbyint)(double x)
 double ASM_MATH(sqrt)(double x)
 {
     return __builtin_sqrt(x);
-}
-
-/*==============================================================================
- * double ASM_MATH(hypot)(double x, double y)
- *------------------------------------------------------------------------------
- * Euclidean norm sqrt(x*x + y*y) computed without spurious overflow or
- * underflow.
- *
- * Parameters:
- *   x (double) - first leg, any finite value; +/-0 allowed.
- *   y (double) - second leg, any finite value; +/-0 allowed.
- * Returns:
- *   sqrt(x^2 + y^2), finite whenever either input is finite.
- * Special cases:
- *   - either operand +/-Inf -> +Inf (even when the other is NaN).
- *   - either operand NaN (no Inf) -> quiet NaN.
- *   - both operands zero -> +0.0.
- * Accuracy / algorithm:
- *   Faithful < 1 ulp; the larger magnitude is factored out with frexp so the
- *   sum of squares stays near 1, then rescaled by the shared exponent.
- *============================================================================*/
-double ASM_MATH(hypot)(double x, double y)
-{
-    /* ---- sign handling: hypot depends only on magnitudes ---- */
-    x = ASM_MATH(fabs)(x);
-    y = ASM_MATH(fabs)(y);
-    /* ---- special values: Inf dominates, otherwise NaN propagates ---- */
-    if (f64_isinf(x) || f64_isinf(y))
-        return F64_INF;
-    if (f64_isnan(x) || f64_isnan(y))
-        return F64_QNAN;
-    /* ---- order the operands so that x is the larger magnitude ---- */
-    if (x < y) {
-        double t = x;
-        x = y;
-        y = t;
-    }
-    if (x == 0.0)
-        return 0.0;                                 /* both zero */
-
-    /* ---- exponent split: x = mx*2^ex, y = my*2^ey, mx/my in [.5,1) ---- */
-    int ex, ey;
-    double mx = ASM_MATH(frexp)(x, &ex);            /* x = mx*2^ex, mx in [.5,1) */
-    double my = ASM_MATH(frexp)(y, &ey);
-    /* ---- align y's exponent to x's so the sum of squares stays near 1 ---- */
-    double s = ASM_MATH(scalbn)(my, ey - ex);       /* scale y to x's exponent */
-    /* ---- reconstruction: sqrt of the near-unity sum, rescaled by 2^ex ---- */
-    double r = ASM_MATH(sqrt)(mx * mx + s * s);
-    return ASM_MATH(scalbn)(r, ex);
-}
-
-/*==============================================================================
- * static void two_prod(double a, double b, double *ph, double *pl)
- *------------------------------------------------------------------------------
- * Dekker's exact two-product split.
- *
- * Parameters:
- *   a  (double)   - multiplicand.
- *   b  (double)   - multiplier.
- *   ph (double *) - out: the high (rounded) part of a*b.
- *   pl (double *) - out: the low-order correction, so *ph + *pl == a*b.
- * Returns:
- *   Nothing; both out-parameters are always written.
- * Special cases:
- *   - Only exact for operands whose split does not overflow; cbrt calls it
- *     with values close to 1, where the identity holds.
- * Accuracy / algorithm:
- *   Exact; Veltkamp splitting with the constant 2^27+1 forms high/low 26-bit
- *   halves, and the leading cancellation (ah*bh - p) recovers the lost terms
- *   without needing an FMA.
- *============================================================================*/
-static void two_prod(double a, double b, double *ph, double *pl)
-{
-    /* ---- Dekker split: split each operand into high/low 26-bit halves ---- */
-    const double split = 134217729.0;               /* 2^27 + 1 */
-    double p = a * b;                               /* rounded product */
-    double ah = a * split;                          /* force the rounding off a */
-    ah = ah - (ah - a);                             /* ah = high 26 bits of a */
-    double al = a - ah;                             /* al = low-order bits of a */
-    double bh = b * split;                          /* same split applied to b */
-    bh = bh - (bh - b);
-    double bl = b - bh;
-    /* ---- reconstruction: subtract p, then add the cross and low terms ---- */
-    *pl = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
-    *ph = p;
-}
-
-/*==============================================================================
- * double ASM_MATH(cbrt)(double x)
- *------------------------------------------------------------------------------
- * Real cube root.
- *
- * Parameters:
- *   x (double) - any finite, infinite, NaN or zero value; negative inputs are
- *     valid because the cube root is an odd function.
- * Returns:
- *   cbrt(x) carrying the sign of x; the input itself for +/-0, +/-Inf, NaN.
- * Special cases:
- *   - x = +/-0.0, +/-Inf, NaN -> x unchanged (sign preserved).
- *   - x < 0 -> negative real root.
- *   - subnormal inputs are normalised by frexp and handled exactly.
- * Accuracy / algorithm:
- *   Faithful < 1 ulp; four plain Newton steps, then two residual-correction
- *   steps using an exact double-double y^3 (no FMA required).
- *============================================================================*/
-double ASM_MATH(cbrt)(double x)
-{
-    /* ---- special values pass straight through ---- */
-    if (x == 0.0 || f64_isinf(x) || f64_isnan(x))
-        return x;                                   /* +/-0, +/-Inf, NaN */
-
-    /* ---- sign handling: solve the positive root, restore the sign last ---- */
-    int neg = f64_signbit(x);
-    double a = f64_from_bits(f64_bits(x) & F64_ABS);
-
-    /* ---- exponent split: e = 3*e3 + r, leaving a mantissa in [0.5, 4) ---- */
-    int e;
-    double m = ASM_MATH(frexp)(a, &e);              /* a = m*2^e, m in [.5,1) */
-    int r = e % 3;
-    if (r < 0)
-        r += 3;                                     /* r = e mod 3 in {0,1,2} */
-    int e3 = (e - r) / 3;
-    double mm = ASM_MATH(scalbn)(m, r);             /* in [0.5, 4) */
-
-    /* ---- Newton iteration: a few plain steps get close ---- */
-    double y = 0.6 + 0.4 * mm;                      /* rough starting guess */
-    for (int k = 0; k < 4; k++)
-        y = y - (y - mm / (y * y)) / 3.0;           /* plain Newton */
-
-    /* ---- refinement: two steps with an exact double-double residual ---- */
-    for (int k = 0; k < 2; k++) {
-        double y2h, y2l, y3h, y3l;
-        two_prod(y, y, &y2h, &y2l);                 /* y^2 = y2h + y2l */
-        two_prod(y2h, y, &y3h, &y3l);               /* y^3 ~= y2*y */
-        y3l += y2l * y;                             /* add the lost y^2 term */
-        double num = (mm - y3h) - y3l;              /* exact-ish residual */
-        y += num / (3.0 * y2h);                     /* y += (m - y^3)/(3 y^2) */
-    }
-
-    /* ---- reconstruction: rescale by 2^e3 and reapply the sign ---- */
-    double res = ASM_MATH(scalbn)(y, e3);
-    return neg ? -res : res;
 }
 
 /*==============================================================================

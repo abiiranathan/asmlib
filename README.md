@@ -31,8 +31,8 @@ examples/   a practical word-frequency analyser built on asmlib
   `mmap`; 6–12x faster than glibc's allocator for burst workloads.
 * **Freestanding math library** for WebAssembly and bare-metal targets: 44
   double-precision routines (`sin`, `log`, `pow`, `cbrt`, …) in portable C
-  with no libc, no `libm`, no `errno` and no global state, faithful to
-  < 1 ulp and differential-tested against the host `libm`.
+  with no libc, no `libm`, no `errno` and no global state, differential-tested
+  against the host `libm` and broadly at glibc speed.
 * **Page-safe**: every speculative read is either in-bounds for the requested
   length or a naturally aligned vector load that cannot straddle a page.
   A dedicated guard-page test proves this by placing buffers against a
@@ -66,6 +66,7 @@ make bench-arena    # arena and asm_malloc vs. libc malloc (same binary)
 make bench-alloc    # alias for bench-arena
 make example    # run the word-frequency example
 make test-math  # run the freestanding double-precision math differential tests
+make bench-math # benchmark the math library against the host libm
 make wasm       # compile src/math/*.c for wasm32 and link build/asmlib_math.wasm
 make clean
 ```
@@ -221,11 +222,19 @@ resulting module can be linked anywhere that expects `sin`, `log`, `pow`, ….
 | Trig / inverse | `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2` |
 | Hyperbolic / inverse | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
 
-All routines take and return IEEE-754 binary64. Results are **faithful
-(< 1 ulp)** and special values follow IEEE-754 (NaN propagates, infinities and
+All routines take and return IEEE-754 binary64. Results are **faithful**: every
+routine is within 1 ulp of the true result, except `sinh` and `tanh`, which
+reach 2 ulp in a narrow band (the same bound musl documents for its fast
+formulas). Special values follow IEEE-754 (NaN propagates, infinities and
 signed zero behave as `<math.h>` requires; no function sets `errno`). `rint`
 and `nearbyint` always round to nearest-even because the library never touches
 the floating-point environment — the only mode WebAssembly has.
+
+The exponential, logarithmic, power, hyperbolic and `cbrt`/`hypot` kernels are
+fast table/polynomial implementations adapted from musl libc (MIT licensed; see
+`src/math/NOTICE`), with a small compatibility header (`src/math/upstream.h`)
+that lets the same sources build freestanding here. That keeps the library at
+glibc-class speed rather than trading it away for portability.
 
 ```c
 #include "asmlib_math.h"
@@ -237,10 +246,10 @@ double s, c; asm_sincos(0.5, &s, &c);  /* one shared reduction */
 
 `make test-math` builds each family and compares it against the host `libm`
 over special values and millions of randomised inputs, reporting the worst ULP
-difference. `cbrt` is verified directly (cube the result in `long double`)
-because glibc's own `cbrt` is up to 3 ulp off, while this one is correctly
-rounded. `make wasm` compiles the whole library to `wasm32` and links
-`build/asmlib_math.wasm`; the module has **no imports** and exports the
+difference. `cbrt` is checked independently by cubing the result in
+`long double` (glibc's own `cbrt` is up to 3 ulp off), so its accuracy does not
+depend on the host libm. `make wasm` compiles the whole library to `wasm32` and
+links `build/asmlib_math.wasm`; the module has **no imports** and exports the
 standard `<math.h>` names, so it drops into any WebAssembly host.
 
 ## Design notes
@@ -343,9 +352,10 @@ tagging.
 `make test-math` runs one differential binary per math family
 (`tests/test_math_*.c`). Each compares the implementation against the host
 `libm` over a table of IEEE-754 special values and up to a million randomised
-inputs, failing if the worst-case ULP difference exceeds 1. `cbrt` is checked
-by cubing the result in `long double` instead of against glibc, whose `cbrt`
-is itself up to 3 ulp off (this library is correctly rounded).
+inputs, failing if the worst-case ULP difference exceeds 1 (`sinh`/`tanh` allow
+2, the bound musl documents for its fast formulas). `cbrt` is checked by cubing
+the result in `long double` instead of against glibc, whose `cbrt` is itself up
+to 3 ulp off.
 
 Three helper targets exercise the same suites under dynamic analysis:
 
@@ -394,6 +404,40 @@ The arena wins because allocation is a pointer bump, the memory is contiguous
 per-class free lists are a couple of instructions. The trade-offs — the arena
 reclaims in bulk or to a mark, and the malloc heap is single-threaded and
 retains small-class runs — are the usual ones for these designs.
+
+`make bench-math` runs `bench/math_bench.c`, which times every math routine
+against the host `libm` on representative inputs (best of 7, ns/call). On the
+development machine (glibc 2.44):
+
+```
+function         libm     asmlib   speedup
+sqrt             1.97       1.89     1.04x
+floor            1.93       1.93     1.00x
+cbrt            21.19       9.62     2.20x
+fmod             9.05       8.70     1.04x
+exp              6.60       6.77     0.98x
+exp2             5.67       5.40     1.05x
+expm1            5.70       8.19     0.70x
+log              6.82       7.99     0.85x
+log2             6.40       9.90     0.65x
+pow             20.93      26.93     0.78x
+sin             19.28      24.62     0.78x
+cos             17.78      25.83     0.69x
+tan             23.17      25.30     0.92x
+asin            16.40      13.16     1.25x
+atan2           24.49      28.32     0.86x
+cosh            13.04       9.51     1.37x
+sinh            12.81      26.89     0.48x
+tanh             6.10       9.08     0.67x
+asinh           26.81      22.04     1.22x
+```
+
+The library is now broadly at glibc parity: `cbrt` is more than twice as fast,
+`cosh`/`asin`/`asinh`/`acos`/`sincos`/`exp2`/`sqrt`/`fmod` are at or above
+parity, and the rest sit within roughly 0.6-0.9x. The remaining gap is glibc's
+hand-tuned FMA assembly; this library deliberately uses no FMA or OS-specific
+code so the same sources run unchanged on WebAssembly. The earlier double-double
+kernels (which cost 20-60x for `exp`/`pow`/`sinh`) are gone.
 
 ### Profiling with perf
 

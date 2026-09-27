@@ -35,10 +35,11 @@ TEST_ARENA_BIN:= $(BUILD)/test_arena
 TEST_ALLOC_BIN:= $(BUILD)/test_alloc
 BENCH_BIN     := $(BUILD)/bench
 BENCH_ARENA_BIN := $(BUILD)/bench_arena
+MATH_BENCH_BIN  := $(BUILD)/math_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math bench bench-arena bench-alloc perfbench example clean wasm
+.PHONY: all test test-valgrind test-asan test-math bench bench-arena bench-alloc bench-math perfbench example clean wasm
 
 all: $(STATIC) $(SHARED)
 
@@ -107,6 +108,14 @@ bench-arena: $(BENCH_ARENA_BIN)
 bench-alloc: $(BENCH_ARENA_BIN)
 	./$(BENCH_ARENA_BIN)
 
+# Math benchmark: asm math vs. the host libm. Compiled with -fno-builtin so the
+# libm side is a real call and cannot be folded to builtins.
+$(MATH_BENCH_BIN): bench/math_bench.c $(MATH_OBJ) include/asmlib_math.h | $(BUILD)
+	$(CC) -O2 -Wall -Wextra -Iinclude -Isrc/math -fno-builtin -o $@ bench/math_bench.c $(MATH_OBJ) -lm
+
+bench-math: $(MATH_BENCH_BIN)
+	./$(MATH_BENCH_BIN)
+
 # One-phase-per-invocation harness for profiling with `perf`:
 #   perf record -o /tmp/p.data ./build/perfbench <phase> [reps]
 # Phases: memcpy memcpy1k memset memset1k memcmp strlen strchr memchr
@@ -125,9 +134,9 @@ example: $(EX_BIN)
 	./$(EX_BIN)
 
 # ---- freestanding math library ----------------------------------------------
-$(BUILD)/math/%.o: src/math/%.c include/asmlib_math.h src/math/math_private.h | $(BUILD)
+$(BUILD)/math/%.o: src/math/%.c include/asmlib_math.h src/math/math_private.h src/math/upstream.h | $(BUILD)
 	@mkdir -p $(dir $@)
-	$(CC) $(MATH_CFLAGS) -c -o $@ $<
+	$(CC) $(MATH_CFLAGS) -msse4.1 -c -o $@ $<
 
 $(BUILD)/test_math_%: tests/test_math_%.c tests/math_test.h $(MATH_OBJ) include/asmlib_math.h | $(BUILD)
 	$(CC) $(MATH_CFLAGS) -o $@ $< $(MATH_OBJ) -lm
@@ -139,6 +148,7 @@ test-math: $(MATH_TEST_BIN)
 # built; the wasm module is linked when wasm-ld is available. Defining
 # ASMLIB_MATH_STD_NAMES makes the module export standard <math.h> symbols.
 wasm:
+	@rm -rf $(BUILD)/wasm
 	@mkdir -p $(BUILD)/wasm
 	@for f in $(MATH_SRC); do \
 		o=$(BUILD)/wasm/$$(basename $$f .c).o; \
@@ -146,7 +156,7 @@ wasm:
 	done
 	@echo "wasm objects built in $(BUILD)/wasm"
 	@if command -v wasm-ld >/dev/null 2>&1; then \
-		wasm-ld --no-entry --export-all -o $(BUILD)/asmlib_math.wasm $(BUILD)/wasm/*.o; \
+		wasm-ld --no-entry --export-all -o $(BUILD)/asmlib_math.wasm $(BUILD)/wasm/*.o && \
 		echo "linked $(BUILD)/asmlib_math.wasm"; \
 	else \
 		echo "wasm-ld not installed: objects compiled, module not linked"; \
