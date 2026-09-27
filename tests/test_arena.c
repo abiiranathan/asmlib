@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/asmlib.h"
+#include "asmlib.h"
 
 static unsigned long checks = 0;
 static unsigned long failures = 0;
@@ -175,22 +175,22 @@ static void test_grow(void) {
 static void test_mmap(void) {
     asm_arena a;
     CHECK(asm_arena_init_mmap(&a, 16384) == 0, "init mmap");
-    void *p = asm_arena_alloc(&a, 100);
+    void* p = asm_arena_alloc(&a, 100);
     CHECK(p != NULL && ((uintptr_t)p & 15) == 0, "mmap alloc");
     memset(p, 0x77, 100);
     size_t cap0 = asm_arena_capacity(&a);
     CHECK(cap0 >= 16384, "mmap first chunk");
     for (int i = 0; i < 200; i++) {
-        void *q = asm_arena_alloc(&a, 1024);
+        void* q = asm_arena_alloc(&a, 1024);
         CHECK(q != NULL, "mmap grow");
         memset(q, 0x33, 1024);
     }
     CHECK(asm_arena_capacity(&a) > cap0, "mmap grew");
-    CHECK(((unsigned char *)p)[0] == 0x77, "mmap data intact");
+    CHECK(((unsigned char*)p)[0] == 0x77, "mmap data intact");
     asm_arena_reset(&a);
     CHECK(asm_arena_capacity(&a) == cap0, "mmap reset shrinks");
     CHECK(asm_arena_used(&a) == 0, "mmap reset used");
-    void *q = asm_arena_alloc(&a, 100);
+    void* q = asm_arena_alloc(&a, 100);
     CHECK(q == p, "mmap reset reuses first chunk");
     asm_arena_destroy(&a);
 }

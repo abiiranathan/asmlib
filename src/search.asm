@@ -34,9 +34,19 @@ section .text
 ;------------------------------------------------------------------------------
 ; Returns a pointer to the first occurrence of (char)c in s, including the
 ; terminating NUL if c == 0, or NULL if the byte is not present.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = s (const char *)     - NUL-terminated string to scan
+;   esi = c (int)              - byte value to find; only the low 8 bits are used
+; Returns:
+;   rax = pointer to the first matching byte, or NULL when absent
+; Uses / clobbers:
+;   Reads rdi/rsi; writes rax/rcx/rdx/r8/r9 and ymm0-4. All xmm/ymm are
+;   caller-saved; no callee-saved register is touched. Makes no calls.
 ;==============================================================================
 global asm_strchr:function
 asm_strchr:
+    ; ---- prologue: broadcast the search byte and a zero vector ------
     vmovd   xmm0, esi                   ; move c into an xmm lane
     vpbroadcastb ymm0, xmm0             ; broadcast c across the vector
     vpxor   ymm2, ymm2, ymm2            ; ymm2 = all zero
@@ -51,7 +61,7 @@ asm_strchr:
     vpmovmskb r8d, ymm3                 ; c mask (relative to the block)
     vpmovmskb r9d, ymm4                 ; NUL mask
     shr     r8d, cl                     ; drop bytes before s
-    shr     r9d, cl
+    shr     r9d, cl                     ; r9d >>= offset (drop bytes before s)
     add     rdi, rcx                    ; rdi = s
     test    r8d, r8d                    ; any c match at/after s?
     jz      .head_no_c                  ; no: continue unless a NUL ends s
@@ -59,24 +69,25 @@ asm_strchr:
     jz      .head_hit                   ; no: the c match is valid
     tzcnt   r8d, r8d                    ; both present: whichever is earlier
     tzcnt   r9d, r9d                    ; wins (c == 0 lands here too)
-    cmp     r8d, r9d
+    cmp     r8d, r9d                    ; c match earlier than the NUL?
     ja      .notfound                   ; NUL precedes c: c is absent
     add     rdi, r8                     ; result = s + position
-    mov     rax, rdi
-    vzeroupper
-    ret
+    mov     rax, rdi                    ; rax = result pointer
+    vzeroupper                          ; drop AVX state
+    ret                                 ; return rax
 .head_hit:
     tzcnt   r8d, r8d                    ; position of the first c at/after s
     add     rdi, r8                     ; result = s + position
-    mov     rax, rdi
-    vzeroupper
-    ret
+    mov     rax, rdi                    ; rax = result pointer
+    vzeroupper                          ; drop AVX state
+    ret                                 ; return rax
 .head_no_c:
     test    r9d, r9d                    ; NUL in the head (at/after s)?
     jnz     .notfound                   ; yes: c is absent
 .head_tail:
     add     rdi, 32                     ; next block (base was s - offset)
     and     rdi, -32                    ; restore the aligned base
+    ; ---- aligned main scan: 32-byte page-safe blocks ----------------
 .main:
     vmovdqa ymm1, [rdi]                 ; aligned, page-safe load
     vpcmpeqb ymm3, ymm1, ymm0           ; bytes equal to c
@@ -88,7 +99,8 @@ asm_strchr:
     test    edx, edx                    ; any NUL?
     jnz     .notfound                   ; NUL with no c: c is absent
     add     rdi, 32                     ; advance to the next block
-    jmp     .main
+    jmp     .main                       ; enter the aligned scan loop
+    ; ---- first c candidate: compare with any NUL in the block ------
 .candidate:
     tzcnt   r8d, ecx                    ; position of the first c match
     test    edx, edx                    ; is there a NUL in the block?
@@ -100,24 +112,36 @@ asm_strchr:
 .found_c:
     add     rdi, r8                     ; combine base and offset
 .found:
-    mov     rax, rdi
-    vzeroupper
-    ret
+    mov     rax, rdi                    ; rax = result pointer
+    vzeroupper                          ; drop AVX state
+    ret                                 ; return rax
+    ; ---- no occurrence: return NULL ---------------------------------
 .notfound:
     xor     eax, eax                    ; return NULL
-    vzeroupper
-    ret
+    vzeroupper                          ; drop AVX state
+    ret                                 ; return rax
 
 ;==============================================================================
 ; char *asm_strrchr(const char *s, int c)
 ;------------------------------------------------------------------------------
 ; Returns a pointer to the last occurrence of (char)c in s, including the
 ; terminating NUL if c == 0, or NULL if the byte is not present.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = s (const char *)     - NUL-terminated string to scan
+;   rsi = c (int)              - byte value to find; only the low 8 bits are used
+; Returns:
+;   rax = pointer to the last matching byte, or NULL when absent
+; Uses / clobbers:
+;   Pushes and restores rbx/r12. Calls asm_strlen and asm_memrchr, which
+;   clobber the caller-saved registers (and xmm/ymm as applicable). Returns
+;   in rax and makes no other calls.
 ;==============================================================================
 global asm_strrchr:function
 asm_strrchr:
+    ; ---- prologue: preserve callee-saved registers ------------------
     push    rbx                         ; preserve callee-saved registers
-    push    r12
+    push    r12                         ; preserve callee-saved r12
     sub     rsp, 8                      ; realign the stack for calls
     mov     rbx, rdi                    ; rbx = s
     mov     r12d, esi                   ; r12d = c
@@ -128,16 +152,18 @@ asm_strrchr:
     mov     esi, r12d                   ; second arg to memrchr
     mov     rdx, rax                    ; search within the string body
     call    asm_memrchr                 ; returns pointer or NULL
-    add     rsp, 8
-    pop     r12
-    pop     rbx
-    ret
+    ; ---- epilogue: restore the stack and callee-saved registers -----
+    add     rsp, 8                      ; restore the stack alignment
+    pop     r12                         ; restore callee-saved r12
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
+    ; ---- c == 0: report the terminating NUL -------------------------
 .nul_char:
     lea     rax, [rbx+rax]              ; pointer to the terminating NUL
-    add     rsp, 8
-    pop     r12
-    pop     rbx
-    ret
+    add     rsp, 8                      ; restore the stack alignment
+    pop     r12                         ; restore callee-saved r12
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
 
 ;==============================================================================
 ; void *asm_memmem(const void *hay, size_t hlen,
@@ -145,18 +171,32 @@ asm_strrchr:
 ;------------------------------------------------------------------------------
 ; Finds the first occurrence of needle[0..nlen) inside hay[0..hlen).
 ; Returns the address or NULL. An empty needle returns hay.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = hay    (const void *) - buffer to search
+;   rsi = hlen   (size_t)       - number of bytes in hay
+;   rdx = needle (const void *) - bytes to find
+;   rcx = nlen   (size_t)       - number of bytes in needle
+; Returns:
+;   rax = pointer to the first match, or NULL when there is none
+; Uses / clobbers:
+;   Pushes and restores rbx/r12/r13/r14/r15. Uses ymm0-3; for a one-byte
+;   needle it calls asm_memchr, otherwise it calls asm_memcmp. Those callees
+;   clobber the caller-saved GPRs and ymm, so the needle vectors are refreshed
+;   after each call.
 ;==============================================================================
 global asm_memmem:function
 asm_memmem:
+    ; ---- prologue: length checks and callee-saved registers ----------
     test    rcx, rcx                    ; empty needle?
     jz      .ret_hay                    ; yes: match at the start
     cmp     rcx, rsi                    ; needle longer than haystack?
     ja      .ret_null                   ; yes: impossible
     push    rbx                         ; preserve callee-saved registers
-    push    r12
-    push    r13
-    push    r14
-    push    r15
+    push    r12                         ; preserve callee-saved r12
+    push    r13                         ; preserve callee-saved r13
+    push    r14                         ; preserve callee-saved r14
+    push    r15                         ; preserve callee-saved r15
     mov     rbx, rdi                    ; rbx = hay
     mov     r12, rdx                    ; r12 = needle
     mov     r13, rcx                    ; r13 = nlen
@@ -184,8 +224,9 @@ asm_memmem:
     vpmovmskb ecx, ymm3                 ; second-byte mask
     shr     ecx, 1                      ; align second-byte mask to starts
     and     eax, ecx                    ; starts matching both bytes (0..30)
-    test    eax, eax
+    test    eax, eax                    ; any candidate start left? (sets ZF)
     jz      .last_byte                  ; none: still check the block's last byte
+    ; ---- candidate start: bounds-check, then verify the needle -----
 .candidate:
     tzcnt   ecx, eax                    ; first candidate within the block
     lea     r11, [r14+rcx]              ; its address
@@ -197,82 +238,97 @@ asm_memmem:
     mov     [rsp], eax                  ; remaining candidate bitmask
     mov     [rsp+8], r11                ; candidate address
     mov     rdi, r11                    ; verify the whole needle
-    mov     rsi, r12
-    mov     rdx, r13
-    call    asm_memcmp
+    mov     rsi, r12                    ; second arg to memcmp (needle)
+    mov     rdx, r13                    ; third arg to memcmp (nlen)
+    call    asm_memcmp                  ; verify the whole needle
     mov     edx, eax                    ; stash the comparison result
     mov     eax, [rsp]                  ; restore the candidate bitmask
     mov     r11, [rsp+8]                ; restore the candidate address
-    add     rsp, 16
+    add     rsp, 16                     ; release the scratch slots
     vmovd   xmm0, [r12]                 ; memcmp clobbered ymm0/ymm2: refresh
-    vpbroadcastb ymm0, xmm0
-    vmovd   xmm2, [r12+1]
-    vpbroadcastb ymm2, xmm2
-    test    edx, edx
+    vpbroadcastb ymm0, xmm0             ; ymm0 = needle[0] in every byte
+    vmovd   xmm2, [r12+1]               ; load needle[1]
+    vpbroadcastb ymm2, xmm2             ; ymm2 = needle[1] in every byte
+    test    edx, edx                    ; needle[0..nlen) equal? (sets ZF)
     jz      .found                      ; full match
 .next_candidate:
     blsr    eax, eax                    ; drop the candidate we just tested
-    test    eax, eax
-    jnz     .candidate
+    test    eax, eax                    ; more candidates left? (sets ZF)
+    jnz     .candidate                  ; more candidates: keep testing
+    ; ---- a start at the block's last byte spans into the next block -
 .last_byte:
     lea     r11, [r14+31]               ; a start at the block's last byte...
     cmp     r11, r15                    ; ...only counts at/before the last start
-    ja      .next_block
+    ja      .next_block                 ; beyond the last valid start: next block
     cmp     r11, rbx                    ; and not before the haystack
-    jb      .next_block
+    jb      .next_block                 ; before the haystack: next block
     movzx   r10d, byte [r12]            ; scalar first-byte compare
-    cmp     r10b, byte [r11]
-    jne     .next_block
+    cmp     r10b, byte [r11]            ; first needle byte equal?
+    jne     .next_block                 ; no: next block
     movzx   r10d, byte [r12+1]          ; scalar second-byte compare
-    cmp     r10b, byte [r11+1]
-    jne     .next_block
+    cmp     r10b, byte [r11+1]          ; second needle byte equal?
+    jne     .next_block                 ; no: next block
     mov     rdi, r11                    ; verify the whole needle
-    mov     rsi, r12
-    mov     rdx, r13
-    call    asm_memcmp
-    test    eax, eax
+    mov     rsi, r12                    ; second arg to memcmp (needle)
+    mov     rdx, r13                    ; third arg to memcmp (nlen)
+    call    asm_memcmp                  ; verify the whole needle
+    test    eax, eax                    ; full needle matched? (sets ZF)
     jz      .found                      ; full match
     vmovd   xmm0, [r12]                 ; memcmp clobbered ymm0/ymm2: refresh
-    vpbroadcastb ymm0, xmm0
-    vmovd   xmm2, [r12+1]
-    vpbroadcastb ymm2, xmm2
+    vpbroadcastb ymm0, xmm0             ; ymm0 = needle[0] in every byte
+    vmovd   xmm2, [r12+1]               ; load needle[1]
+    vpbroadcastb ymm2, xmm2             ; ymm2 = needle[1] in every byte
+    ; ---- advance to the next aligned block --------------------------
 .next_block:
     add     r14, 32                     ; advance one aligned block
-    jmp     .scan_block
+    jmp     .scan_block                 ; scan the next aligned block
+    ; ---- one-byte needle: defer to asm_memchr -----------------------
 .single:
     mov     rdx, rsi                    ; hlen (rsi is still the argument)
     movzx   esi, byte [r12]             ; search for the single byte
-    mov     rdi, rbx
-    call    asm_memchr
-    jmp     .pop_ret
+    mov     rdi, rbx                    ; first arg to memchr (hay)
+    call    asm_memchr                  ; single-byte search
+    jmp     .pop_ret                    ; unwrap the stack and return
 .found:
     mov     rax, r11                    ; match address
-    jmp     .pop_ret
+    jmp     .pop_ret                    ; unwrap the stack and return
 .notfound:
     xor     eax, eax                    ; no match
+    ; ---- common epilogue: drop AVX state and restore registers ------
 .pop_ret:
-    vzeroupper
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    ret
+    vzeroupper                          ; drop AVX state
+    pop     r15                         ; restore callee-saved r15
+    pop     r14                         ; restore callee-saved r14
+    pop     r13                         ; restore callee-saved r13
+    pop     r12                         ; restore callee-saved r12
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
 .ret_hay:
     mov     rax, rdi                    ; empty needle matches at hay
-    ret
+    ret                                 ; return rax
 .ret_null:
     xor     eax, eax                    ; needle too long
-    ret
+    ret                                 ; return rax
 
 ;==============================================================================
 ; char *asm_strstr(const char *hay, const char *needle)
 ;------------------------------------------------------------------------------
 ; Finds the first occurrence of the NUL-terminated needle inside hay.
 ; Returns the address or NULL. An empty needle returns hay.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = hay    (const char *) - NUL-terminated string to search
+;   rsi = needle (const char *) - NUL-terminated substring to find
+; Returns:
+;   rax = pointer to the first match, or NULL when there is none
+; Uses / clobbers:
+;   Pushes and restores rbx/r12/r13. Calls asm_strlen twice and then
+;   asm_memmem; for a one-character needle it tail-calls asm_strchr. Those
+;   callees clobber the caller-saved registers (and xmm/ymm as applicable).
 ;==============================================================================
 global asm_strstr:function
 asm_strstr:
+    ; ---- prologue: classify the needle by its first bytes -----------
     movzx   eax, byte [rsi]             ; needle[0]
     test    al, al                      ; empty needle?
     jz      .empty                      ; yes: match at hay
@@ -280,8 +336,8 @@ asm_strstr:
     test    cl, cl                      ; one-character needle?
     jz      .one                        ; yes: strchr needs no strlen(hay)
     push    rbx                         ; preserve callee-saved registers
-    push    r12
-    push    r13
+    push    r12                         ; preserve callee-saved r12
+    push    r13                         ; preserve callee-saved r13
     mov     rbx, rdi                    ; rbx = hay
     mov     r12, rsi                    ; r12 = needle
     call    asm_strlen                  ; rax = strlen(hay)
@@ -293,37 +349,50 @@ asm_strstr:
     mov     rsi, r13                    ; hlen
     mov     rdx, r12                    ; needle
     call    asm_memmem                  ; rax = result
-    pop     r13
-    pop     r12
-    pop     rbx
-    ret
+    ; ---- epilogue: restore callee-saved registers and return --------
+    pop     r13                         ; restore callee-saved r13
+    pop     r12                         ; restore callee-saved r12
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
+    ; ---- empty needle matches at hay --------------------------------
 .empty:
     mov     rax, rdi                    ; empty needle matches at hay
-    ret
+    ret                                 ; return rax
+    ; ---- one-character needle: defer to asm_strchr ------------------
 .one:
     movzx   esi, byte [rsi]             ; single byte: a plain strchr is optimal
     jmp     asm_strchr                  ; tail call (rdi is already hay)
 
 ;==============================================================================
-; Internal helper: build the 256-byte membership table used by the span
-; routines. On entry rsi points at the accept string and rsp points at the
-; 256-byte table. Clobbers rax, rcx and ymm0.
+; BUILD_ACCEPT_TABLE - build a 256-byte membership table on the stack
+;------------------------------------------------------------------------------
+; Purpose: zero a caller-provided 256-byte buffer and then set table[c] = 1
+; for every byte c listed in the NUL-terminated accept string, so the span
+; routines can test membership with a single indexed load.
+;
+; Parameters:
+;   (none)
+;
+; Registers / side effects:
+;   Reads rsi (the accept pointer) and rsp (the table base). Clobbers rax, rcx
+;   and ymm0, and writes into [rsp, rsp+256). The table is only valid while
+;   the caller keeps the stack allocation that holds it.
 ;==============================================================================
 %macro BUILD_ACCEPT_TABLE 0
     vpxor   ymm0, ymm0, ymm0            ; zero the table with 32-byte stores
-%assign off 0
-%rep 8
-    vmovdqu [rsp+off], ymm0
-%assign off off+32
-%endrep
+%assign off 0                           ; off = 0 (table offset)
+%rep 8                                  ; eight 32-byte stores cover 256 bytes
+    vmovdqu [rsp+off], ymm0             ; store 32 zero bytes at [rsp+off]
+%assign off off+32                      ; advance the table offset
+%endrep                                 ; end of the zero-fill loop
     mov     rcx, rsi                    ; rcx = accept pointer
 %%build:
     movzx   eax, byte [rcx]             ; next accept byte
     test    al, al                      ; end of accept string?
     jz      %%done                      ; yes: table is complete
     mov     byte [rsp+rax], 1           ; mark byte as a member
-    inc     rcx
-    jmp     %%build
+    inc     rcx                         ; advance past this accept byte
+    jmp     %%build                     ; process the next accept byte
 %%done:
 %endmacro
 
@@ -331,14 +400,26 @@ asm_strstr:
 ; size_t asm_strspn(const char *s, const char *accept)
 ;------------------------------------------------------------------------------
 ; Length of the initial segment of s made only of bytes from accept.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = s      (const char *) - string to scan
+;   rsi = accept (const char *) - set of accepted bytes
+; Returns:
+;   rax = length of the initial run of bytes that are in accept
+; Uses / clobbers:
+;   Pushes and restores rbx. Reserves a 256-byte stack table via
+;   BUILD_ACCEPT_TABLE (clobbering rax/rcx/ymm0 and that scratch area).
+;   Returns in rax and makes no other calls.
 ;==============================================================================
 global asm_strspn:function
 asm_strspn:
+    ; ---- prologue: allocate and build the membership table ----------
     push    rbx                         ; preserve callee-saved register
     sub     rsp, 256                    ; scratch membership table
     BUILD_ACCEPT_TABLE                  ; fill [rsp, rsp+256)
     mov     rax, rdi                    ; rax = scan pointer
     xor     edx, edx                    ; rdx = count
+    ; ---- table-driven scan of s -------------------------------------
 .scan:
     movzx   ecx, byte [rax]             ; next source byte
     test    cl, cl                      ; NUL?
@@ -347,26 +428,39 @@ asm_strspn:
     je      .done                       ; no: stop
     inc     rax                         ; advance
     inc     rdx                         ; count a byte
-    jmp     .scan
+    jmp     .scan                       ; continue scanning
+    ; ---- end of segment: return the count ---------------------------
 .done:
     mov     rax, rdx                    ; return the length
-    vzeroupper
-    add     rsp, 256
-    pop     rbx
-    ret
+    vzeroupper                          ; drop AVX state
+    add     rsp, 256                    ; release the membership table
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
 
 ;==============================================================================
 ; size_t asm_strcspn(const char *s, const char *accept)
 ;------------------------------------------------------------------------------
 ; Length of the initial segment of s made only of bytes NOT in accept.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = s      (const char *) - string to scan
+;   rsi = accept (const char *) - set of rejected bytes
+; Returns:
+;   rax = length of the initial run of bytes that are not in accept
+; Uses / clobbers:
+;   Pushes and restores rbx. Reserves a 256-byte stack table via
+;   BUILD_ACCEPT_TABLE (clobbering rax/rcx/ymm0 and that scratch area).
+;   Returns in rax and makes no other calls.
 ;==============================================================================
 global asm_strcspn:function
 asm_strcspn:
+    ; ---- prologue: allocate and build the membership table ----------
     push    rbx                         ; preserve callee-saved register
     sub     rsp, 256                    ; scratch membership table
     BUILD_ACCEPT_TABLE                  ; fill [rsp, rsp+256)
     mov     rax, rdi                    ; rax = scan pointer
     xor     edx, edx                    ; rdx = count
+    ; ---- table-driven scan of s -------------------------------------
 .scan:
     movzx   ecx, byte [rax]             ; next source byte
     test    cl, cl                      ; NUL?
@@ -375,26 +469,39 @@ asm_strcspn:
     jne     .done                       ; yes: stop
     inc     rax                         ; advance
     inc     rdx                         ; count a byte
-    jmp     .scan
+    jmp     .scan                       ; continue scanning
+    ; ---- end of segment: return the count ---------------------------
 .done:
     mov     rax, rdx                    ; return the length
-    vzeroupper
-    add     rsp, 256
-    pop     rbx
-    ret
+    vzeroupper                          ; drop AVX state
+    add     rsp, 256                    ; release the membership table
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
 
 ;==============================================================================
 ; char *asm_strpbrk(const char *s, const char *accept)
 ;------------------------------------------------------------------------------
 ; Returns a pointer to the first byte of s that also occurs in accept, or
 ; NULL if there is none.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = s      (const char *) - string to scan
+;   rsi = accept (const char *) - set of bytes to look for
+; Returns:
+;   rax = pointer to the first matching byte, or NULL when there is none
+; Uses / clobbers:
+;   Pushes and restores rbx. Reserves a 256-byte stack table via
+;   BUILD_ACCEPT_TABLE (clobbering rax/rcx/ymm0 and that scratch area).
+;   Returns in rax and makes no other calls.
 ;==============================================================================
 global asm_strpbrk:function
 asm_strpbrk:
+    ; ---- prologue: allocate and build the membership table ----------
     push    rbx                         ; preserve callee-saved register
     sub     rsp, 256                    ; scratch membership table
     BUILD_ACCEPT_TABLE                  ; fill [rsp, rsp+256)
     mov     rax, rdi                    ; rax = scan pointer
+    ; ---- table-driven scan of s -------------------------------------
 .scan:
     movzx   ecx, byte [rax]             ; next source byte
     test    cl, cl                      ; NUL?
@@ -402,17 +509,19 @@ asm_strpbrk:
     cmp     byte [rsp+rcx], 0           ; byte a member of accept?
     jne     .found                      ; yes: report this address
     inc     rax                         ; advance
-    jmp     .scan
+    jmp     .scan                       ; continue scanning
+    ; ---- membership hit: return this address ------------------------
 .found:
-    vzeroupper
-    add     rsp, 256
-    pop     rbx
-    ret
+    vzeroupper                          ; drop AVX state
+    add     rsp, 256                    ; release the membership table
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
+    ; ---- no hit: return NULL ----------------------------------------
 .notfound:
     xor     eax, eax                    ; return NULL
-    vzeroupper
-    add     rsp, 256
-    pop     rbx
-    ret
+    vzeroupper                          ; drop AVX state
+    add     rsp, 256                    ; release the membership table
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return rax
 
 GNU_STACK_NOTE
