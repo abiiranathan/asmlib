@@ -80,6 +80,7 @@ make test-libc  # run the portable (wasm) memory/string/allocator tests
 make test-mt    # run the multithreaded allocator stress tests
 make bench-math # benchmark the math library against the host libm
 make wasm       # build the freestanding wasm32 module (math + portable libc)
+make wasm-example   # build + run the double-pendulum wasm demo in Node
 make clean
 ```
 
@@ -519,6 +520,34 @@ $ make example
   occurrences of "lazy dog": 40000
   strcasecmp("Hello", "hELLo") = 0
 ```
+
+### Double-pendulum WebAssembly demo
+
+`examples/double_pendulum.c` + `examples/double_pendulum.js` are a real-world
+end-to-end test: a chaotic double pendulum integrated with RK4, compiled to
+`wasm32` and run in Node with asmlib supplying **both** the math (`sin`, `cos`,
+`fabs`) and, through the portable backend, the runtime — the module has no
+imports. `make wasm-example` builds `build/double_pendulum.wasm` and runs it:
+
+```
+$ make wasm-example
+== asmlib wasm double-pendulum example ==
+  module          : 56759 bytes, 0 imports
+  samples         : 200000 steps (100.0 s of motion)
+  wall time       : 194.8 ms  (1.0M steps/s)
+  energy drift    : 6.319e-9 %
+  tip x range     : [-1.9919, 2.0000]
+  tip y range     : [-1.9996, 0.4828]
+  max reach       : 2.0000 m (bound 2 m)
+  f32 final speed : 5.5722 rad/s
+OK: double pendulum conserved energy and stayed physical
+```
+
+The driver checks four things that would expose a broken math or memory
+routine: the module is import-free, the RK4 integrator conserves energy to
+~1e-9 relative, the tip never leaves the 2 m arm reach, and the single-
+precision path stays finite. The same source builds natively (host libm) for
+cross-checking.
 
 ## Freestanding and portability
 

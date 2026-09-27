@@ -46,7 +46,7 @@ MATH_BENCH_BIN  := $(BUILD)/math_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm
+.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm wasm-example
 
 all: $(STATIC) $(SHARED)
 
@@ -196,6 +196,24 @@ wasm:
 	else \
 		echo "wasm-ld not installed: objects compiled, module not linked"; \
 	fi
+
+# Real-world wasm demo: a double pendulum integrated with asmlib as the
+# freestanding math + libc, linked with the library objects into one module and
+# run from Node (examples/double_pendulum.js).
+WASM_EX_OBJ := $(BUILD)/wasm/double_pendulum.o
+WASM_EX     := $(BUILD)/double_pendulum.wasm
+
+wasm-example:
+	@rm -rf $(BUILD)/wasm
+	@mkdir -p $(BUILD)/wasm
+	@for f in $(MATH_SRC) $(LIBC_SRC); do \
+		o=$(BUILD)/wasm/$$(basename $$f .c).o; \
+		$(WASM_CC) $(MATH_CFLAGS) -Isrc/libc -DASMLIB_MATH_STD_NAMES -DASMLIB_LIBC_STD_NAMES -c -o $$o $$f || exit 1; \
+	done
+	$(WASM_CC) $(MATH_CFLAGS) -DASMLIB_MATH_STD_NAMES -c -o $(WASM_EX_OBJ) examples/double_pendulum.c
+	wasm-ld --no-entry --export-all -o $(WASM_EX) $(BUILD)/wasm/*.o
+	@echo "linked $(WASM_EX)"
+	node examples/double_pendulum.js
 
 clean:
 	rm -rf $(BUILD)

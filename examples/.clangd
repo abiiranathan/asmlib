@@ -1,4 +1,6 @@
-# Include path for the example program: asmlib.h lives in include/.
+# Include paths for the examples: asmlib.h lives in include/, and the wasm
+# double-pendulum example includes asmlib_math.h when built with
+# ASMLIB_MATH_STD_NAMES.
 CompileFlags:
   Add:
     - -I../include

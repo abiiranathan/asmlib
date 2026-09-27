@@ -60,12 +60,12 @@
  * builds without the atomics feature are single-threaded, so the lock is a
  * no-op there.
  *----------------------------------------------------------------------------*/
-static volatile int g_lock;
-
 #if defined(__wasm__) && !defined(__wasm_atomics__)
 static inline void asm_lock(void) {}
 static inline void asm_unlock(void) {}
 #else
+static volatile int g_lock;
+
 static inline void asm_lock(void) {
     while (__atomic_exchange_n(&g_lock, 1, __ATOMIC_ACQUIRE)) { }
 }
