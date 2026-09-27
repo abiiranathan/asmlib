@@ -80,6 +80,15 @@ long   ASM_MATH(lround)(double x);                  /* round away from zero->lon
 long long ASM_MATH(llround)(double x);              /* round away -> long long    */
 double ASM_MATH(nan)(const char *tag);              /* quiet NaN (tag ignored)    */
 
+/* ---- fused multiply-add ------------------------------------------------ */
+double ASM_MATH(fma)(double x, double y, double z); /* correctly rounded x*y + z   */
+
+/* ---- error and gamma functions ---------------------------------------- */
+double ASM_MATH(erf)(double x);                     /* error function             */
+double ASM_MATH(erfc)(double x);                    /* complementary error func   */
+double ASM_MATH(tgamma)(double x);                  /* true gamma                 */
+double ASM_MATH(lgamma)(double x);                  /* log |gamma(x)|             */
+
 /* ---- exponential and logarithmic -------------------------------------- */
 double ASM_MATH(exp)(double x);
 double ASM_MATH(exp2)(double x);

@@ -20,7 +20,7 @@ examples/   a practical word-frequency analyser built on asmlib
 ## Highlights
 
 * **Memory, string, comparison, search, ctype, an arena allocator and a
-  malloc-style heap** — 67 routines in all, no libc dependency anywhere.
+  malloc-style heap** — 71 routines in all, no libc dependency anywhere.
 * **AVX2 / BMI1 / BMI2** where they win: 32-byte vector scans, `tzcnt`/`bsr`
   bit-indexing, branchless ASCII case folding.
 * **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64) let
@@ -31,9 +31,9 @@ examples/   a practical word-frequency analyser built on asmlib
   exist for.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
   `mmap`; 6–12x faster than glibc's allocator for burst workloads.
-* **Freestanding math library** for WebAssembly and bare-metal targets: 51
-  double-precision routines (`sin`, `log`, `pow`, `cbrt`, …) in portable C
-  with no libc, no `libm`, no `errno` and no global state, differential-tested
+* **Freestanding math library** for WebAssembly and bare-metal targets: 56
+  double-precision routines (`sin`, `log`, `pow`, `cbrt`, `erf`, …) in portable
+  C with no libc, no `libm`, no `errno` and no global state, differential-tested
   against the host `libm` and broadly at glibc speed.
 * **Page-safe**: every speculative read is either in-bounds for the requested
   length or a naturally aligned vector load that cannot straddle a page.
@@ -193,12 +193,19 @@ must be freed individually rather than in bulk.
 | `asm_malloc(size)` | 16-byte aligned block |
 | `asm_calloc(count, size)` | zeroed block |
 | `asm_realloc(ptr, size)` | grow/shrink, preserving contents |
+| `asm_reallocarray(ptr, count, size)` | overflow-checked resize |
 | `asm_free(ptr)` | release a block |
+| `asm_malloc_usable_size(ptr)` | usable bytes in a block |
+| `asm_posix_memalign(&p, align, size)` | aligned block, POSIX return code |
+| `asm_aligned_alloc(align, size)` | aligned block, C11 |
 
 Small requests come from per-size-class slab runs replenished by `mmap`;
 requests above 4080 bytes get an individual page-rounded mapping. Pointers
 from `asm_malloc` must be released with `asm_free` (and not with libc `free`).
 The heap is single-threaded and small-class runs are retained for reuse.
+`asm_posix_memalign`/`asm_aligned_alloc` support any power-of-two alignment
+via a small indirect header, and the resulting pointers are released normally
+with `asm_free` (and may be passed to `asm_realloc`).
 
 ```c
 char *buf = asm_malloc(256);
@@ -229,14 +236,16 @@ resulting module can be linked anywhere that expects `sin`, `log`, `pow`, ….
 | Trig / inverse | `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2` |
 | Hyperbolic / inverse | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
 | Step / integer / misc | `nextafter`, `remquo`, `lrint`, `llrint`, `lround`, `llround`, `nan` |
+| FMA / special | `fma`, `erf`, `erfc`, `tgamma`, `lgamma` |
 
 All routines take and return IEEE-754 binary64. Results are **faithful**: every
-routine is within 1 ulp of the true result, except `sinh` and `tanh`, which
-reach 2 ulp in a narrow band (the same bound musl documents for its fast
-formulas). Special values follow IEEE-754 (NaN propagates, infinities and
-signed zero behave as `<math.h>` requires; no function sets `errno`). `rint`
-and `nearbyint` always round to nearest-even because the library never touches
-the floating-point environment — the only mode WebAssembly has.
+routine is within 1 ulp of the true result, except `sinh`, `tanh` and `erfc`,
+which reach 2 ulp in narrow bands (the bounds musl documents for its fast
+formulas); `fma` is correctly rounded. Special values follow IEEE-754 (NaN
+propagates, infinities and signed zero behave as `<math.h>` requires; no
+function sets `errno`). `rint` and `nearbyint` always round to nearest-even
+because the library never touches the floating-point environment — the only
+mode WebAssembly has.
 
 The exponential, logarithmic, power, hyperbolic and `cbrt`/`hypot` kernels are
 fast table/polynomial implementations adapted from musl libc (MIT licensed; see

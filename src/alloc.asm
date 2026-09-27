@@ -7,6 +7,10 @@
 ;   void *asm_calloc (size_t count, size_t size);
 ;   void *asm_realloc(void *ptr, size_t size);
 ;   void  asm_free   (void *ptr);
+;   void *asm_reallocarray(void *ptr, size_t count, size_t size);
+;   void *asm_aligned_alloc(size_t alignment, size_t size);
+;   int   asm_posix_memalign(void **memptr, size_t alignment, size_t size);
+;   size_t asm_malloc_usable_size(void *ptr);
 ;
 ; Strategy
 ; --------
@@ -17,8 +21,13 @@
 ; * Larger requests get their own page-rounded anonymous mapping, stored with
 ;   its length so asm_free can munmap it exactly.
 ; * Every returned pointer is 16-byte aligned. Blocks carry a 16-byte header
-;   immediately before the payload holding the class index (or -1 for a large
-;   mapping) and, for large blocks, the mapped size.
+;   immediately before the payload holding the class index (-1 for a large
+;   mapping, -2 for an aligned/indirect block) and, for large blocks, the
+;   mapped size. An indirect header stores the backing asm_malloc block so the
+;   over-aligned pointer frees exactly what it borrowed.
+; * Over-aligned requests bigger than 16 bytes are satisfied by allocating a
+;   backing block with room for the alignment slack, then stamping an indirect
+;   header in front of the aligned payload.
 ;
 ; The allocator is single-threaded and never returns small-run memory to the
 ; kernel (like a slab); large blocks are returned. That matches the usual
@@ -39,6 +48,8 @@ extern asm_sys_munmap
 %define RUN_SIZE        65536           ; size_t RUN_SIZE - target bytes per slab run
 %define HDR             16              ; size_t HDR - per-block header size in bytes
 %define NUM_CLASSES     512             ; size_t NUM_CLASSES - free-list slots (max class index 256)
+%define INDIRECT        (-2)            ; size_t INDIRECT - aligned/indirect block marker
+%define SIZE_MAX        (-1)            ; size_t SIZE_MAX - largest representable size_t
 
 section .bss
 align 64
@@ -131,7 +142,8 @@ asm_malloc:
 ;   rax = unused (void)
 ; Uses / clobbers:
 ;   Reads rdi; writes rax, r8, r9. Small blocks are pushed back on their class
-;   list; large blocks tail-call asm_sys_munmap. No callee-saved registers used.
+;   list; large blocks tail-call asm_sys_munmap; indirect (over-aligned) blocks
+;   tail-call asm_free on their backing block. No callee-saved registers used.
 ;==============================================================================
 global asm_free:function
 asm_free:
@@ -139,9 +151,11 @@ asm_free:
     test    rdi, rdi                    ; ptr == NULL?
     jz      .ret                        ; free(NULL) is a no-op
     ; ---- recover the class index from the header ----
-    mov     rax, [rdi-HDR]              ; class index, or -1
+    mov     rax, [rdi-HDR]              ; class index, -1 or -2
     cmp     rax, -1                     ; large mapping marker?
     je      .large                      ; yes -> munmap it
+    cmp     rax, INDIRECT               ; aligned/indirect marker?
+    je      .indirect                   ; yes -> release the backing block
     ; ---- small: push the block onto its class list ----
     lea     r9, [rel malloc_freelist]   ; small: push onto its class list
     mov     r8, [r9+rax*8]              ; r8 = old list head
@@ -149,6 +163,12 @@ asm_free:
     mov     [r9+rax*8], rdi             ; class head = this block
 .ret:
     ret                                 ; return (small block recycled)
+    ; ---- indirect: free the backing block instead ----
+.indirect:
+    mov     rdi, [rdi-HDR+8]            ; rdi = orig backing block
+    test    rdi, rdi                    ; orig == NULL?
+    jz      .ret                        ; nothing to release
+    jmp     asm_free                    ; tail-call free(orig)
     ; ---- large: unmap the whole mapping ----
 .large:
     mov     rsi, [rdi-HDR+8]            ; mapped length
@@ -212,7 +232,8 @@ asm_calloc:
 ;------------------------------------------------------------------------------
 ; Grows or shrinks a block. Keeps the pointer when the request fits the
 ; existing usable size, otherwise allocates, copies min(old,new) and frees.
-;ptrNULL behaves like asm_malloc(size); size 0 frees and returns NULL.
+; Over-aligned (indirect) blocks always move through asm_malloc. ptr NULL
+; behaves like asm_malloc(size); size 0 frees and returns NULL.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = ptr (void *)  - existing block, or NULL
@@ -221,7 +242,7 @@ asm_calloc:
 ;   rax = resized block, or NULL on overflow or allocation failure
 ; Uses / clobbers:
 ;   Reads rdi, rsi; writes rax, rdx. Pushes/restores rbx and r12-r15.
-;   Calls asm_malloc, asm_memcpy and asm_free.
+;   Calls asm_malloc, asm_malloc_usable_size, asm_memcpy and asm_free.
 ;==============================================================================
 global asm_realloc:function
 asm_realloc:
@@ -239,9 +260,11 @@ asm_realloc:
     test    r13, r13                    ; new size == 0?
     jz      .free_null                  ; realloc(p, 0) frees p
     ; ---- recover the old usable size from the header ----
-    mov     rax, [r12-HDR]              ; old usable size
+    mov     rax, [r12-HDR]              ; class index, -1 or -2
     cmp     rax, -1                     ; large mapping marker?
     je      .large_old                  ; yes -> size stored in header
+    cmp     rax, INDIRECT               ; aligned/indirect marker?
+    je      .indirect_old               ; yes -> usable comes from the backing block
     shl     rax, 4                      ; class size
     sub     rax, HDR                    ; usable = class_size - header
     jmp     .have_old                   ; old size resolved
@@ -258,7 +281,18 @@ asm_realloc:
     ; ---- in-place fit check ----
     cmp     rbx, r14                    ; does it fit in place?
     jbe     .inplace                    ; fits in place -> keep pointer
+    jmp     .move                       ; no -> move to a new block
+    ; ---- indirect: old usable = backing usable - (ptr - orig) ----
+.indirect_old:
+    mov     rbx, [r12-HDR+8]            ; rbx = orig backing block
+    mov     rdi, rbx                    ; arg1 = orig
+    call    asm_malloc_usable_size      ; rax = backing usable
+    mov     rcx, r12                    ; rcx = ptr
+    sub     rcx, rbx                    ; rcx = ptr - orig (header offset)
+    sub     rax, rcx                    ; usable -= the alignment offset
+    mov     r14, rax                    ; r14 = old usable
     ; ---- allocate a new block, copy and free the old ----
+.move:
     mov     rdi, r13                    ; allocate a new block
     call    asm_malloc                  ; allocate the new block
     test    rax, rax                    ; allocation succeeded?
@@ -301,6 +335,230 @@ asm_realloc:
     pop     r12                         ; restore ptr
     pop     rbx                         ; restore rbx
     ret                                 ; return
+
+;==============================================================================
+; void *asm_reallocarray(void *ptr, size_t count, size_t size)
+;------------------------------------------------------------------------------
+; Overflow-checked asm_realloc. When count != 0 and size > SIZE_MAX/count the
+; product would wrap; NULL is returned and ptr is left untouched. Otherwise the
+; request is forwarded to asm_realloc(ptr, count*size).
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = ptr (void *)  - existing block, or NULL
+;   rsi = count (size_t)  - element count
+;   rdx = size (size_t)  - element size in bytes
+; Returns:
+;   rax = resized block, or NULL on overflow or allocation failure
+; Uses / clobbers:
+;   Reads rdi, rsi, rdx; writes rax, rcx, rdx, r8. Tail-calls asm_realloc.
+;==============================================================================
+global asm_reallocarray:function
+asm_reallocarray:
+    ; ---- count == 0: the product is 0 -> realloc(ptr, 0) ----
+    test    rsi, rsi                    ; count == 0?
+    jz      .zero                       ; yes -> forward a zero-size request
+    ; ---- overflow check: size > SIZE_MAX / count ? ----
+    mov     r8, rdx                     ; r8 = size
+    mov     rax, SIZE_MAX               ; rax = SIZE_MAX (dividend low half)
+    xor     edx, edx                    ; rdx = 0 (dividend high half)
+    div     rsi                         ; rax = SIZE_MAX / count
+    cmp     r8, rax                     ; size > SIZE_MAX / count?
+    ja      .overflow                   ; yes -> the product would wrap
+    ; ---- product is safe: count * size ----
+    mov     rax, rsi                    ; rax = count
+    mul     r8                          ; rdx:rax = count * size (high half is 0)
+    mov     rsi, rax                    ; arg2 = product
+    jmp     asm_realloc                 ; tail-call realloc(ptr, product)
+.zero:
+    xor     esi, esi                    ; arg2 = 0
+    jmp     asm_realloc                 ; realloc(ptr, 0) frees ptr and returns NULL
+.overflow:
+    xor     eax, eax                    ; rax = NULL (overflow)
+    ret                                 ; return NULL without touching ptr
+
+;==============================================================================
+; size_t asm_malloc_usable_size(void *ptr)
+;------------------------------------------------------------------------------
+; Usable payload bytes in a block from asm_malloc, or 0 for NULL. A small
+; class block reports class*16 - header; a large block reports its mapped
+; length minus the header; an over-aligned (indirect) block reports its backing
+; block's usable size minus the alignment offset.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = ptr (void *)  - block previously returned by asm_malloc, or NULL
+; Returns:
+;   rax = usable payload bytes, or 0 when ptr is NULL
+; Uses / clobbers:
+;   Reads rdi; writes rax, rcx, rdx, r8. No callee-saved registers used.
+;==============================================================================
+global asm_malloc_usable_size:function
+asm_malloc_usable_size:
+    ; ---- NULL has no usable bytes ----
+    test    rdi, rdi                    ; ptr == NULL?
+    jz      .null                       ; yes -> 0
+    ; ---- decode the header marker ----
+    mov     rax, [rdi-HDR]              ; class index, -1 or -2
+    cmp     rax, -1                     ; large mapping marker?
+    je      .large                      ; yes -> mapped length stored in header
+    cmp     rax, INDIRECT               ; aligned/indirect marker?
+    je      .indirect                   ; yes -> ask the backing block
+    ; ---- small class: usable = class_size - header ----
+    shl     rax, 4                      ; class size
+    sub     rax, HDR                    ; minus the block header
+    ret                                 ; return usable bytes
+.large:
+    mov     rax, [rdi-HDR+8]            ; mapped length
+    sub     rax, HDR                    ; minus the block header
+    ret                                 ; return usable bytes
+.indirect:
+    ; ---- indirect: backing usable minus the alignment offset ----
+    mov     r8, [rdi-HDR+8]             ; r8 = orig backing block
+    mov     rax, [r8-HDR]               ; backing class index (never indirect)
+    cmp     rax, -1                     ; backing is a large mapping?
+    je      .ind_large                  ; yes -> mapped length in header
+    shl     rax, 4                      ; backing class size
+    sub     rax, HDR                    ; backing usable
+    jmp     .ind_sub                    ; apply the alignment offset
+.ind_large:
+    mov     rax, [r8-HDR+8]             ; backing mapped length
+    sub     rax, HDR                    ; backing usable
+.ind_sub:
+    sub     rdi, r8                     ; rdi = ptr - orig (alignment offset)
+    sub     rax, rdi                    ; usable -= offset
+    ret                                 ; return usable bytes
+.null:
+    xor     eax, eax                    ; rax = 0
+    ret                                 ; return 0
+
+;==============================================================================
+; void *asm_aligned_alloc(size_t alignment, size_t size)
+;------------------------------------------------------------------------------
+; Allocates `size` bytes whose address is a multiple of `alignment` (a
+; non-zero power of two), or NULL on invalid alignment or allocation failure.
+; C11 would also require size to be a multiple of alignment; we deliberately
+; relax that and accept any size.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = alignment (size_t)  - required alignment (power of two)
+;   rsi = size (size_t)  - requested payload size
+; Returns:
+;   rax = aligned block, or NULL on invalid alignment or failure
+; Uses / clobbers:
+;   Reads rdi, rsi; writes rax, rcx, rdx. Pushes/restores rbx and r12, r13.
+;   Calls asm_malloc.
+;==============================================================================
+global asm_aligned_alloc:function
+asm_aligned_alloc:
+    ; ---- validate the alignment (non-zero power of two) ----
+    test    rdi, rdi                    ; alignment == 0?
+    jz      .bad                        ; invalid -> NULL
+    mov     rax, rdi                    ; rax = alignment
+    dec     rax                         ; rax = alignment - 1
+    test    rdi, rax                    ; more than one bit set?
+    jnz     .bad                        ; not a power of two -> NULL
+    cmp     rdi, 16                     ; alignment <= 16?
+    ja      .big                        ; over-aligned -> indirect block
+    ; ---- alignment <= 16: asm_malloc is already 16-byte aligned ----
+    mov     rdi, rsi                    ; arg1 = size
+    jmp     asm_malloc                  ; tail-call malloc(size)
+    ; ---- over-aligned: carve an indirect block ----
+.big:
+    ; ---- prologue: preserve callee-saved registers ----
+    push    rbx                         ; preserve callee-saved registers
+    push    r12                         ; save alignment
+    push    r13                         ; save size
+    mov     r12, rdi                    ; r12 = alignment
+    mov     r13, rsi                    ; r13 = size
+    ; ---- total = size + alignment + header (with overflow checks) ----
+    mov     rbx, r13                    ; rbx = size
+    add     rbx, r12                    ; rbx = size + alignment
+    jc      .fail                       ; overflow -> fail
+    add     rbx, HDR                    ; rbx = size + alignment + header
+    jc      .fail                       ; overflow -> fail
+    ; ---- allocate the backing block ----
+    mov     rdi, rbx                    ; arg1 = total bytes
+    call    asm_malloc                  ; orig = malloc(total)
+    test    rax, rax                    ; allocation succeeded?
+    jz      .fail                       ; failed -> return NULL
+    ; ---- p = align_up(orig + header, alignment) ----
+    lea     rcx, [rax+HDR]              ; rcx = orig + header
+    lea     rdx, [r12-1]                ; rdx = alignment - 1
+    add     rcx, rdx                    ; rcx = orig + header + alignment - 1
+    not     rdx                         ; rdx = ~(alignment - 1)
+    and     rcx, rdx                    ; rcx = align_up(orig + header, alignment)
+    ; ---- stamp the indirect header just before p ----
+    mov     qword [rcx-HDR], INDIRECT   ; qword0 = indirect marker
+    mov     [rcx-HDR+8], rax            ; qword1 = orig backing block
+    mov     rax, rcx                    ; rax = aligned payload
+    ; ---- epilogue ----
+    pop     r13                         ; restore size
+    pop     r12                         ; restore alignment
+    pop     rbx                         ; restore rbx
+    ret                                 ; return aligned block
+    ; ---- failure path ----
+.fail:
+    xor     eax, eax                    ; rax = NULL (failure)
+    pop     r13                         ; restore size
+    pop     r12                         ; restore alignment
+    pop     rbx                         ; restore rbx
+    ret                                 ; return NULL
+    ; ---- invalid alignment -> NULL ----
+.bad:
+    xor     eax, eax                    ; rax = NULL (bad alignment)
+    ret                                 ; return NULL
+
+;==============================================================================
+; int asm_posix_memalign(void **memptr, size_t alignment, size_t size)
+;------------------------------------------------------------------------------
+; POSIX posix_memalign: stores an `alignment`-aligned block of `size` bytes at
+; *memptr and returns 0; returns EINVAL(22) for an alignment that is not a
+; power of two or is below sizeof(void*), and ENOMEM(12) on allocation failure.
+; *memptr is left untouched on both error paths.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = memptr (void **)  - out-parameter receiving the block
+;   rsi = alignment (size_t)  - required alignment (power of two, >= 8)
+;   rdx = size (size_t)  - requested payload size
+; Returns:
+;   rax = 0 on success, EINVAL(22) on bad alignment, ENOMEM(12) on failure
+; Uses / clobbers:
+;   Reads rdi, rsi, rdx; writes rax and *memptr. Pushes/restores rbx.
+;   Calls asm_aligned_alloc.
+;==============================================================================
+global asm_posix_memalign:function
+asm_posix_memalign:
+    ; ---- prologue: preserve the out-parameter ----
+    push    rbx                         ; preserve callee-saved register
+    mov     rbx, rdi                    ; rbx = memptr
+    ; ---- validate the alignment (non-zero power of two, >= sizeof(void*)) ----
+    test    rsi, rsi                    ; alignment == 0?
+    jz      .einval                     ; invalid -> EINVAL
+    mov     rax, rsi                    ; rax = alignment
+    dec     rax                         ; rax = alignment - 1
+    test    rsi, rax                    ; more than one bit set?
+    jnz     .einval                     ; not a power of two -> EINVAL
+    cmp     rsi, 8                      ; alignment < sizeof(void*)?
+    jb      .einval                     ; too small -> EINVAL
+    ; ---- allocate and hand the block back ----
+    mov     rdi, rsi                    ; arg1 = alignment
+    mov     rsi, rdx                    ; arg2 = size
+    call    asm_aligned_alloc           ; p = aligned_alloc(align, size)
+    test    rax, rax                    ; allocation succeeded?
+    jz      .enomem                     ; failed -> ENOMEM
+    mov     [rbx], rax                  ; *memptr = p (only on success)
+    xor     eax, eax                    ; return 0 (success)
+    pop     rbx                         ; restore out-parameter
+    ret                                 ; return 0
+    ; ---- invalid alignment -> EINVAL ----
+.einval:
+    mov     eax, 22                     ; EINVAL
+    pop     rbx                         ; restore out-parameter
+    ret                                 ; return EINVAL
+    ; ---- allocation failure -> ENOMEM ----
+.enomem:
+    mov     eax, 12                     ; ENOMEM
+    pop     rbx                         ; restore out-parameter
+    ret                                 ; return ENOMEM
 
 ;==============================================================================
 ; internal: L_alloc_run(size_t class_index) -> void *block

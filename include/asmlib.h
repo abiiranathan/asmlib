@@ -293,6 +293,20 @@ void* asm_calloc(size_t count, size_t size);
 void* asm_realloc(void* ptr, size_t size);
 void asm_free(void* ptr);
 
+/* Resize ptr to count*size bytes, rejecting any 64-bit overflow of the
+ * product (returns NULL and leaves ptr valid). */
+void* asm_reallocarray(void* ptr, size_t count, size_t size);
+
+/* Allocate size bytes aligned to alignment (a non-zero power of two). */
+void* asm_aligned_alloc(size_t alignment, size_t size);
+
+/* POSIX posix_memalign: 0 on success, EINVAL(22) for a bad alignment or
+ * ENOMEM(12) on failure; *memptr is left untouched on both error paths. */
+int asm_posix_memalign(void** memptr, size_t alignment, size_t size);
+
+/* Usable payload bytes in a block from asm_malloc, or 0 for NULL. */
+size_t asm_malloc_usable_size(void* ptr);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
@@ -344,6 +358,10 @@ void asm_free(void* ptr);
 #define isgraph     asm_isgraph
 #define ispunct     asm_ispunct
 #define isblank     asm_isblank
+#define reallocarray       asm_reallocarray
+#define malloc_usable_size asm_malloc_usable_size
+#define posix_memalign     asm_posix_memalign
+#define aligned_alloc      asm_aligned_alloc
 #endif /* ASMLIB_ENABLE_LIBC_ALIASES */
 
 #endif /* ASMLIB_H */
