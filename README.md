@@ -9,21 +9,30 @@ header plus static and shared libraries.
 ```
 src/        NASM sources (one module per area)
 include/    asmlib.h — the public C API
-tests/      differential + page-boundary test suite
-bench/      asmlib vs. libc micro-benchmark
+tests/      differential + page-boundary + arena + malloc test suites
+bench/      asmlib vs. libc micro-benchmarks, arena/malloc vs. malloc
 examples/   a practical word-frequency analyser built on asmlib
 ```
 
 ## Highlights
 
-* **39 routines** covering memory, string, comparison, searching and ctype.
+* **Memory, string, comparison, search, ctype, an arena allocator and a
+  malloc-style heap** — 64 routines in all, no libc dependency anywhere.
 * **AVX2 / BMI1 / BMI2** where they win: 32-byte vector scans, `tzcnt`/`bsr`
   bit-indexing, branchless ASCII case folding.
+* **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64) let
+  both the arena and the malloc heap obtain memory with no libc and no
+  caller-supplied allocator.
+* **Chunked, resettable arena allocator** with alignment, mark/release and
+  optional growth. 8–34x faster than `malloc`/`free` for the bursts arenas
+  exist for.
+* **malloc/calloc/realloc/free** on a segregated free-list heap backed by
+  `mmap`; 6–12x faster than glibc's allocator for burst workloads.
 * **Page-safe**: every speculative read is either in-bounds for the requested
   length or a naturally aligned vector load that cannot straddle a page.
   A dedicated guard-page test proves this by placing buffers against a
   `PROT_NONE` page.
-* **Differential tested**: **3,013,989** checks pass against the host libc over
+* **Differential tested**: 3M+ checks pass against the host libc over
   exhaustive and randomised inputs, including all alignments and edge sizes.
 * **Two usage modes**: call the `asm_*` names, or define
   `ASMLIB_ENABLE_LIBC_ALIASES` to transparently replace the standard names.
@@ -47,7 +56,9 @@ make            # build/build/libasmlib.a and build/libasmlib.so
 make test       # run the full test suite
 make test-asan  # run it under AddressSanitizer + UndefinedBehaviorSanitizer
 make test-valgrind  # run it under valgrind memcheck (OOB + leak checks)
-make bench      # run the benchmark
+make bench      # run the string/memory benchmark vs. libc
+make bench-arena    # arena and asm_malloc vs. libc malloc (same binary)
+make bench-alloc    # alias for bench-arena
 make example    # run the word-frequency example
 make clean
 ```
@@ -113,6 +124,72 @@ Predicates return `1` for true and `0` for false.
 ### CPU (`cpu.asm`)
 `unsigned asm_cpu_features(void)` and `int asm_cpu_has_avx2(void)`.
 
+### Arena allocator (`arena.asm`)
+
+A chunked, resettable linear (bump) allocator for temporary/scratch memory.
+
+| Function | Purpose |
+|---|---|
+| `asm_arena_init(a, buf, size)` | fixed arena over caller memory |
+| `asm_arena_init_grow(a, alloc, free, ctx, chunk_size)` | growable arena |
+| `asm_arena_init_mmap(a, chunk_size)` | growable arena backed by `mmap` |
+| `asm_arena_alloc(a, size)` | 16-byte aligned block |
+| `asm_arena_alloc_aligned(a, size, align)` | power-of-two aligned block |
+| `asm_arena_calloc(a, count, size)` | zeroed block |
+| `asm_arena_realloc(a, ptr, old, new)` | in-place growth when last |
+| `asm_arena_mark(a, &m)` / `asm_arena_release(a, &m)` | scoped rollback |
+| `asm_arena_reset(a)` | release all but the first chunk, rewind |
+| `asm_arena_destroy(a)` | release everything |
+| `asm_arena_used/peak/remaining/capacity(a)` | statistics |
+
+Every allocation is at least 16-byte aligned and exhaustion returns `NULL`
+instead of overrunning. `reset()` is O(number of chunks) and is the tool for
+per-frame/per-request scratch spaces; `mark`/`release` gives nested scopes.
+The backing callbacks are `alloc(size, ctx)` and `free(ptr, size, ctx)` — the
+size is passed so `munmap`-style backends can release exactly.
+
+```c
+#include "asmlib.h"
+
+asm_arena a;
+asm_arena_init_mmap(&a, 1 << 16);          /* chunks straight from the kernel */
+
+char *name = asm_arena_alloc(&a, 64);
+int  *nums = asm_arena_calloc(&a, 100, sizeof *nums);
+nums      = asm_arena_realloc(&a, nums, 100 * sizeof *nums, 200 * sizeof *nums);
+
+asm_mark m;
+asm_arena_mark(&a, &m);
+for (int i = 0; i < 1000; i++) asm_arena_alloc(&a, 32);  /* scratch */
+asm_arena_release(&a, &m);                               /* free the scratch */
+
+asm_arena_reset(&a);          /* or rewind the whole arena at once */
+asm_arena_destroy(&a);        /* release every chunk */
+```
+
+### malloc-style heap (`alloc.asm`)
+
+A segregated free-list allocator served directly by `mmap`, for when memory
+must be freed individually rather than in bulk.
+
+| Function | Purpose |
+|---|---|
+| `asm_malloc(size)` | 16-byte aligned block |
+| `asm_calloc(count, size)` | zeroed block |
+| `asm_realloc(ptr, size)` | grow/shrink, preserving contents |
+| `asm_free(ptr)` | release a block |
+
+Small requests come from per-size-class slab runs replenished by `mmap`;
+requests above 4080 bytes get an individual page-rounded mapping. Pointers
+from `asm_malloc` must be released with `asm_free` (and not with libc `free`).
+The heap is single-threaded and small-class runs are retained for reuse.
+
+```c
+char *buf = asm_malloc(256);
+buf = asm_realloc(buf, 1024);
+asm_free(buf);
+```
+
 ## Design notes
 
 * **ABI.** All routines follow the System V AMD64 ABI. The leaf routines use
@@ -148,6 +225,22 @@ Predicates return `1` for true and `0` for false.
   more, and `memcpy` uses non-temporal stores (with an `sfence`) for copies
   of 2 MiB or more when the destination is 32-byte aligned, avoiding
   read-for-ownership traffic.
+* **Arena.** Chunks carry a 48-byte header (backing pointer, chain link,
+  usable capacity, backing size, data pointer); allocations bump a pointer
+  and round the size up to 16 bytes. Growing keeps the caller's allocator, so
+  the allocator itself has no dependency on `malloc`; `asm_arena_init_mmap`
+  supplies one backed by anonymous `mmap`. `reset` frees every chunk after the
+  first in one pass; a `mark` records the chunk, pointer and byte count so
+  `release` can rewind and reclaim precisely. The free callback receives the
+  chunk's backing size so `munmap` can unmap it exactly.
+* **OS memory and the malloc heap.** `sys.asm` holds the only platform
+  specific code — raw `mmap`/`munmap` syscalls (Linux x86-64). `alloc.asm`
+  builds `malloc`/`calloc`/`realloc`/`free` on top: requests up to 4080 bytes
+  are rounded to a 16-byte size class and served from a per-class free list
+  replenished by a slab run; larger requests get their own page-rounded
+  mapping. Every block is 16-byte aligned and carries a 16-byte header with
+  its class (or the mapping length), so `free` needs no size argument. The
+  heap is single-threaded and retains small-class runs.
 
 ### Performance approach
 
@@ -174,7 +267,17 @@ dedicated two-way algorithm) is within roughly 0.6-0.8x.
    verified);
 4. sanity-checks the CPU feature detection.
 
-Two helper targets exercise the same suite under dynamic analysis:
+and `tests/test_arena.c`, which covers fixed, growable and mmap-backed arenas,
+alignment, exhaustion returning `NULL`, `calloc`/`realloc`, `mark`/`release`,
+`reset` and a randomised overlap stress test (every block is tagged and
+re-verified so any overlap or corruption is caught).
+
+`tests/test_alloc.c` covers the malloc-style heap: alignment, `calloc`
+zeroing, `realloc` in place and across the small/large boundary, and a
+200,000-operation randomised alloc/free/realloc stress test with content
+tagging.
+
+Three helper targets exercise the same suites under dynamic analysis:
 
 * `make test-asan` builds with `-fsanitize=address,undefined` (and leak
   detection) and runs it. This catches any harness bug and any heap/stack
@@ -200,6 +303,28 @@ the most heavily optimised `strstr` (two-way) and on the smallest sizes where
 call overhead dominates. The benchmark makes the trade-offs visible and
 guards against regressions.
 
+`make bench-arena` (alias `make bench-alloc`) compares the arena and the
+malloc heap against glibc `malloc`/`free`. Both use only raw `mmap` — there is
+no libc allocator on their side. On the development machine (best of 9 trials,
+ns per operation):
+
+```
+workload                              asm       malloc   speedup
+arena   1000 x 64B                   3.54        29.06     8.22x
+arena   4000 mixed 8..512B           3.35        62.24    18.60x
+arena   1000 x 64B +memset           5.16        30.76     5.96x
+malloc  1000 x 64B                   5.07        29.20     5.76x
+malloc  4000 mixed 8..512B           5.80        69.72    12.01x
+2048 x 1KiB fill+release (us)        15.40       521.73    33.87x
+```
+
+The arena wins because allocation is a pointer bump, the memory is contiguous
+(cache-predictable), and a reset is one rewind rather than thousands of
+`free` calls. The malloc heap wins over glibc on burst workloads because its
+per-class free lists are a couple of instructions. The trade-offs — the arena
+reclaims in bulk or to a mark, and the malloc heap is single-threaded and
+retains small-class runs — are the usual ones for these designs.
+
 ## Example
 
 `examples/example.c` — a word-frequency analyser that reads a text file (or
@@ -223,12 +348,22 @@ $ make example
   strcasecmp("Hello", "hELLo") = 0
 ```
 
+## Freestanding and portability
+
+The string/memory routines and the arena's fixed and callback modes have no
+OS or libc dependency and link under `-nostdlib`. The only platform-specific
+code is `src/sys.asm` (Linux x86-64 `mmap`/`munmap`); on bare metal or another
+OS, pass your own `alloc`/`free` to `asm_arena_init_grow` and skip
+`asm_arena_init_mmap` and `asm_malloc`. The test/benchmark harnesses use libc,
+but the library itself does not.
+
 ## Porting to AArch64
 
 The API in `include/asmlib.h` is architecture-neutral. A future `src/aarch64/`
 module can implement the same `asm_*` symbols with NEON/AdvSIMD (e.g. `ld1`,
-`cmeq`, `umaxv`) and the `Makefile` can select the target with a variable,
-leaving the tests, benchmark, example and header unchanged.
+`cmeq`, `umaxv`) plus the AArch64 `mmap` syscall, and the `Makefile` can select
+the target with a variable, leaving the tests, benchmark, example and header
+unchanged.
 
 ## License
 

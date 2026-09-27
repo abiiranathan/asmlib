@@ -161,6 +161,120 @@ int asm_isgraph(int c);     /* 0x21..0x7E                              */
 int asm_ispunct(int c);     /* printable, non-alphanumeric             */
 int asm_isblank(int c);     /* space or horizontal tab                 */
 
+/*==============================================================================
+ * Arena allocator (arena.asm)
+ *------------------------------------------------------------------------------
+ * A chunked, resettable linear (bump) allocator. Every allocation is at
+ * least 16-byte aligned and exhaustion returns NULL rather than overrunning
+ * memory. It is single-threaded.
+ *
+ * The struct layout is part of the ABI; do not reorder the fields.
+ *============================================================================*/
+
+typedef struct asm_arena_chunk asm_arena_chunk;   /* opaque */
+
+typedef struct asm_arena {
+    unsigned char   *ptr;      /* next free byte in the current chunk      */
+    unsigned char   *end;      /* end of the current chunk                 */
+    asm_arena_chunk *cur;      /* current (newest) chunk                   */
+    asm_arena_chunk *first;    /* first chunk; reset() rewinds to it       */
+    void            *(*alloc)(size_t size, void *ctx); /* backing allocator */
+    void             (*free)(void *ptr, size_t size, void *ctx); /* release   */
+    void            *ctx;      /* backing allocator context                */
+    size_t           chunk;    /* default size for new growable chunks     */
+    size_t           total;    /* usable bytes across all chunks           */
+    size_t           used;     /* bytes handed out since the last reset    */
+    size_t           peak;     /* high-water mark of `used`                */
+} asm_arena;
+
+/* Scoped rollback token for asm_arena_mark/asm_arena_release. */
+typedef struct asm_mark {
+    asm_arena_chunk *chunk;
+    unsigned char   *ptr;
+    size_t           used;
+} asm_mark;
+
+/* Initialise a fixed arena over caller-owned buf of `size` bytes.
+ * The first 64 bytes are reserved for bookkeeping. Returns 0, or -1. */
+int asm_arena_init(asm_arena *a, void *buf, size_t size);
+
+/* Initialise a growable arena. alloc(size, ctx) must return 16-byte aligned
+ * memory or NULL; free(ptr, size, ctx) may be NULL. Returns 0, or -1. */
+int asm_arena_init_grow(asm_arena *a,
+                        void *(*alloc)(size_t size, void *ctx),
+                        void  (*free)(void *ptr, size_t size, void *ctx),
+                        void *ctx, size_t chunk_size);
+
+/* Growable arena whose chunks come from anonymous mmap (Linux x86-64). This
+ * needs no libc and no caller-supplied allocator. Returns 0, or -1. */
+int asm_arena_init_mmap(asm_arena *a, size_t chunk_size);
+
+/* Allocate at least `size` bytes (16-byte aligned), or NULL. */
+void *asm_arena_alloc(asm_arena *a, size_t size);
+
+/* Allocate `size` bytes aligned to `align` (a power of two), or NULL. */
+void *asm_arena_alloc_aligned(asm_arena *a, size_t size, size_t align);
+
+/* Allocate count*size zeroed bytes, or NULL. */
+void *asm_arena_calloc(asm_arena *a, size_t count, size_t size);
+
+/* Resize an allocation. Grows in place when it is the most recent block,
+ * otherwise moves and copies min(old, nw) bytes. ptr may be NULL. */
+void *asm_arena_realloc(asm_arena *a, void *ptr, size_t old, size_t nw);
+
+/* Snapshot the current position for scoped rollback. */
+void asm_arena_mark(const asm_arena *a, asm_mark *m);
+
+/* Roll back to a mark, releasing all newer chunks. Returns 0, or -1 if the
+ * mark does not belong to this arena. */
+int asm_arena_release(asm_arena *a, const asm_mark *m);
+
+/* Release every chunk except the first and rewind to its start. */
+void asm_arena_reset(asm_arena *a);
+
+/* Release all chunks (if a free callback is set) and clear the arena. */
+void asm_arena_destroy(asm_arena *a);
+
+/* Bytes handed out since the last reset. */
+size_t asm_arena_used(const asm_arena *a);
+
+/* High-water mark of asm_arena_used() since the last reset. */
+size_t asm_arena_peak(const asm_arena *a);
+
+/* Free bytes remaining in the current chunk. */
+size_t asm_arena_remaining(const asm_arena *a);
+
+/* Total usable bytes currently backed by all chunks. */
+size_t asm_arena_capacity(const asm_arena *a);
+
+/*==============================================================================
+ * Opaque OS memory primitives (sys.asm, Linux x86-64)
+ *------------------------------------------------------------------------------
+ * Anonymous mmap/munmap. asm_sys_alloc/asm_sys_free match the arena callback
+ * signatures and can be passed to asm_arena_init_grow().
+ *============================================================================*/
+
+void *asm_sys_mmap(size_t size);                 /* page-aligned or NULL */
+int   asm_sys_munmap(void *ptr, size_t size);    /* 0 or -errno          */
+void *asm_sys_alloc(size_t size, void *ctx);     /* arena alloc callback */
+void  asm_sys_free(void *ptr, size_t size, void *ctx); /* arena free cb   */
+
+/*==============================================================================
+ * malloc-style allocator (alloc.asm)
+ *------------------------------------------------------------------------------
+ * A segregated free-list allocator served directly by mmap, with no libc
+ * dependency. Every pointer is 16-byte aligned.
+ *
+ * IMPORTANT: these manage their own heap; a pointer from asm_malloc must be
+ * released with asm_free and never with libc free (and vice versa). The
+ * allocator is single-threaded.
+ *============================================================================*/
+
+void *asm_malloc(size_t size);
+void *asm_calloc(size_t count, size_t size);
+void *asm_realloc(void *ptr, size_t size);
+void  asm_free(void *ptr);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
