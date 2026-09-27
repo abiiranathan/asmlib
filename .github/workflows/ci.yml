@@ -42,6 +42,18 @@ jobs:
       - name: memcheck
         run: make test-valgrind
 
+  aarch64:
+    name: AArch64 cross + qemu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross toolchain + qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+      - name: Cross-build and run the differential suites under qemu
+        run: make test-aarch64
+
   wasm:
     name: wasm32 build
     runs-on: ubuntu-latest

@@ -10,6 +10,7 @@ header plus static and shared libraries.
 
 ```
 src/        NASM sources (one module per area)
+src/aarch64/ hand-written AArch64 assembly port (same API, NEON)
 src/math/   freestanding C math library (no libc; builds for wasm32)
 src/libc/   portable C memory/string/allocator backend for wasm/freestanding
 include/    asmlib.h — the public C API; asmlib_math.h — the math API
@@ -45,6 +46,9 @@ examples/   a practical word-frequency analyser built on asmlib
   exhaustive and randomised inputs, including all alignments and edge sizes.
 * **Two usage modes**: call the `asm_*` names, or define
   `ASMLIB_ENABLE_LIBC_ALIASES` to transparently replace the standard names.
+* **Two architectures**: the hand-written assembly is available for x86-64
+  (NASM, AVX2) and AArch64 (GNU as, NEON), exposing the same `asm_*` API; the
+  AArch64 build is cross-compiled and verified under QEMU in CI.
 * **WebAssembly-ready.** A portable C backend (`src/libc/`) brings the memory,
   string and allocator API to freestanding targets, and `make wasm` links it
   with the math library into `build/asmlib.wasm` — a no-import module exporting
@@ -83,6 +87,8 @@ make wasm       # build the freestanding wasm32 module (math + portable libc)
 make wasm-lib   # build the double-pendulum library module (clean C ABI)
 make wasm-serve # serve the browser double-pendulum UI on :8000
 make wasm-example   # non-interactive check of the pendulum library module
+make aarch64        # cross-build the AArch64 port (aarch64-linux-gnu-gcc)
+make test-aarch64   # run the AArch64 suites under qemu-aarch64-static
 make clean
 ```
 
@@ -593,13 +599,33 @@ freestanding libc-subset + libm** module with no imports. The arena allocator
 is not yet available on wasm (it is NASM today); the portable `malloc` is the
 wasm allocator.
 
-## Porting to AArch64
+## AArch64 port
 
-The API in `include/asmlib.h` is architecture-neutral. A future `src/aarch64/`
-module can implement the same `asm_*` symbols with NEON/AdvSIMD (e.g. `ld1`,
-`cmeq`, `umaxv`) plus the AArch64 `mmap` syscall, and the `Makefile` can select
-the target with a variable, leaving the tests, benchmark, example and header
-unchanged.
+The API in `include/asmlib.h` is architecture-neutral, and the library now has
+a hand-written **AArch64** implementation in `src/aarch64/` (GNU assembly, NEON)
+covering the whole string/memory/search/ctype/arena/malloc surface — the same
+`asm_*` symbols as the x86-64 NASM build:
+
+```
+src/aarch64/  common_aarch64.inc  sys.S  memory.S  string.S  strcmp.S
+              search.S  ctype.S  cpu.S  arena.S  alloc.S
+```
+
+It follows AAPCS64 (arguments `x0..x7`, callee-saved `x19..x29`, 16-byte stack)
+and uses the AArch64 `mmap`/`munmap` syscalls. `asm_cpu_has_avx2()` returns 0
+(those feature bits are x86-only).
+
+Build and test it by cross-compiling and running the *same* differential suites
+under QEMU user-mode emulation:
+
+```sh
+make aarch64        # cross-build build/aarch64/libasmlib.a
+make test-aarch64   # build + run test_asmlib/test_arena/test_alloc under qemu
+```
+
+Requires `aarch64-linux-gnu-gcc` (gcc-aarch64-linux-gnu) and `qemu-aarch64-static`
+(qemu-user-static). All three suites pass on AArch64 (7.56M + 423 + 1,225 checks,
+0 failures), and CI runs this on every push.
 
 ## License
 

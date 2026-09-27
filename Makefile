@@ -18,6 +18,17 @@ OBJ       := $(patsubst src/%.asm,$(BUILD)/%.o,$(SRC_ASM))
 HEADER    := include/asmlib.h
 INC       := src/common.inc
 
+# ---- AArch64 port (hand-written assembly, cross-compiled and run under qemu) -
+#   make ARCH=aarch64 test        cross-build the aarch64 lib and run the
+#                                 differential suite under qemu-aarch64-static
+A64_CC    ?= aarch64-linux-gnu-gcc
+A64_AR    ?= aarch64-linux-gnu-ar
+A64_QEMU  ?= qemu-aarch64-static
+A64_SRC   := $(wildcard src/aarch64/*.S)
+A64_OBJ   := $(patsubst src/aarch64/%.S,$(BUILD)/aarch64/%.o,$(A64_SRC))
+A64_STATIC:= $(BUILD)/aarch64/libasmlib.a
+A64_CFLAGS?= -O2 -Wall -Wextra -Iinclude -Isrc/aarch64 -static
+
 STATIC    := $(BUILD)/libasmlib.a
 SHARED    := $(BUILD)/libasmlib.so
 
@@ -46,7 +57,7 @@ MATH_BENCH_BIN  := $(BUILD)/math_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm wasm-lib wasm-example wasm-serve
+.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm wasm-lib wasm-example wasm-serve test-aarch64 aarch64
 
 all: $(STATIC) $(SHARED)
 
@@ -234,6 +245,35 @@ wasm-serve: wasm-lib
 # Non-interactive check of the library module's C ABI, from Node.
 wasm-example: wasm-lib
 	node examples/double_pendulum.js $(WASM_LIB)
+
+# ---- AArch64 port (hand-written assembly) -----------------------------------
+# Cross-compile the aarch64 sources and build + run the same differential test
+# suite under qemu-aarch64-static. Requires aarch64-linux-gnu-gcc and qemu.
+$(BUILD)/aarch64/%.o: src/aarch64/%.S src/aarch64/common_aarch64.inc | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(A64_CC) -c -Isrc/aarch64 -o $@ $<
+
+$(A64_STATIC): $(A64_OBJ)
+	$(A64_AR) rcs $@ $^
+
+# The differential harnesses reuse tests/asmlib.h API; build with the aarch64
+# library and run under qemu.
+$(BUILD)/aarch64_test_asmlib: tests/test_asmlib.c $(A64_STATIC) $(HEADER) | $(BUILD)
+	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_asmlib.c $(A64_STATIC)
+
+$(BUILD)/aarch64_test_arena: tests/test_arena.c $(A64_STATIC) $(HEADER) | $(BUILD)
+	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_arena.c $(A64_STATIC)
+
+$(BUILD)/aarch64_test_alloc: tests/test_alloc.c $(A64_STATIC) $(HEADER) | $(BUILD)
+	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_alloc.c $(A64_STATIC)
+
+aarch64: $(A64_STATIC)
+	@echo "built $(A64_STATIC)"
+
+test-aarch64: aarch64 $(BUILD)/aarch64_test_asmlib $(BUILD)/aarch64_test_arena $(BUILD)/aarch64_test_alloc
+	$(A64_QEMU) $(BUILD)/aarch64_test_asmlib
+	$(A64_QEMU) $(BUILD)/aarch64_test_arena
+	$(A64_QEMU) $(BUILD)/aarch64_test_alloc
 
 clean:
 	rm -rf $(BUILD)

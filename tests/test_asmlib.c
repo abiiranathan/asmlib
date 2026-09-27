@@ -485,10 +485,16 @@ static void test_guards(void) {
  *----------------------------------------------------------------------------*/
 static void test_cpu(void) {
     unsigned f = asm_cpu_features();
-    /* This library is being exercised, so AVX2/BMI1 must be present. */
+    /* On x86-64 this library requires AVX2/BMI1, so they must be present. On
+     * AArch64 those bits are x86-only and asm_cpu_has_avx2() is 0 by design. */
+#if defined(__x86_64__) || defined(__i386__)
     CHECK((f & ASMLIB_CPU_AVX2) != 0, "cpu avx2");
     CHECK((f & ASMLIB_CPU_BMI1) != 0, "cpu bmi1");
     CHECK(asm_cpu_has_avx2() == 1, "cpu has_avx2");
+#else
+    CHECK((f & ASMLIB_CPU_AVX2) == 0, "cpu no-avx2");
+    CHECK(asm_cpu_has_avx2() == 0, "cpu no-has_avx2");
+#endif
     printf("       cpu features = 0x%02x\n", f);
 }
 
