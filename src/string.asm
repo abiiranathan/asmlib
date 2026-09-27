@@ -6,7 +6,10 @@
 ;   size_t asm_strlen (const char *s);
 ;   size_t asm_strnlen(const char *s, size_t maxlen);
 ;   char  *asm_strncpy(char *dst, const char *src, size_t n);
+;   char  *asm_stpncpy(char *dst, const char *src, size_t n);
 ;   char  *asm_strncat(char *dst, const char *src, size_t n);
+;   size_t asm_strlcpy(char *dst, const char *src, size_t size);
+;   size_t asm_strlcat(char *dst, const char *src, size_t size);
 ;
 ; All speculative vector reads are page safe: strlen-style scans align the
 ; pointer down to a 32-byte boundary first (never crossing a 4096-byte page),
@@ -306,6 +309,67 @@ asm_strncpy:
     ret                                 ; return rax = dst
 
 ;==============================================================================
+; char *asm_stpncpy(char *dst, const char *src, size_t n)
+;------------------------------------------------------------------------------
+; POSIX stpncpy: copies at most n bytes of src. If src is shorter than n the
+; rest of the n-byte region is NUL-padded. Returns a pointer to the NUL that
+; terminates dst when src fitted (strlen(src) < n), otherwise dst + n.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = dst (char *)        - destination buffer
+;   rsi = src (const char *)  - source string
+;   rdx = n   (size_t)        - size of the destination region
+; Returns:
+;   rax = dst + strlen(src) when strlen(src) < n (the written NUL),
+;         else dst + n
+; Uses / clobbers:
+;   Pushes and restores rbx/r12/r13/r14 (callee-saved) and reserves 8 bytes
+;   to keep rsp 16-byte aligned at every call; calls asm_strnlen, asm_memcpy
+;   and asm_memset; result in rax.
+;==============================================================================
+global asm_stpncpy:function             ; export asm_stpncpy as a function symbol
+asm_stpncpy:
+    ; ---- prologue: preserve callee-saved registers, align the stack ----
+    push    rbx                         ; preserve callee-saved registers
+    push    r12                         ; save r12 (callee-saved)
+    push    r13                         ; save r13 (callee-saved)
+    push    r14                         ; save r14 (callee-saved)
+    sub     rsp, 8                      ; keep the stack 16-byte aligned
+    mov     rbx, rdi                    ; rbx = dst
+    mov     r12, rsi                    ; r12 = src
+    mov     r13, rdx                    ; r13 = n
+    ; ---- copy the bounded string, then pad the remainder ---------------
+    mov     rdi, rsi                    ; first arg to strnlen
+    mov     rsi, rdx                    ; second arg to strnlen
+    call    asm_strnlen                 ; rax = min(strlen(src), n)
+    mov     r14, rax                    ; r14 = copied length
+    mov     rdi, rbx                    ; destination
+    mov     rsi, r12                    ; source
+    mov     rdx, r14                    ; count
+    call    asm_memcpy                  ; copy the string bytes
+    cmp     r14, r13                    ; did src fill the whole region?
+    jae     .full                       ; yes: no terminating NUL was written
+    ; ---- src shorter than n: NUL-pad the tail, return the NUL ----------
+    lea     rdi, [rbx+r14]              ; start of the padding region
+    xor     esi, esi                    ; fill with NUL
+    mov     rdx, r13                    ; total requested
+    sub     rdx, r14                    ; remaining bytes to zero
+    call    asm_memset                  ; pad with NULs
+    lea     rax, [rbx+r14]              ; return the terminating NUL
+    jmp     .done                       ; common epilogue
+    ; ---- src filled the region: return just past it --------------------
+.full:
+    lea     rax, [rbx+r13]              ; return dst + n
+    ; ---- epilogue: restore the saved registers and return --------------
+.done:
+    add     rsp, 8                      ; undo the stack alignment adjustment
+    pop     r14                         ; restore r14
+    pop     r13                         ; restore r13
+    pop     r12                         ; restore r12
+    pop     rbx                         ; restore rbx
+    ret                                 ; return rax
+
+;==============================================================================
 ; char *asm_strncat(char *dst, const char *src, size_t n)
 ;------------------------------------------------------------------------------
 ; Appends at most n bytes of src to dst and always NUL-terminates. Returns dst.
@@ -353,5 +417,134 @@ asm_strncat:
     pop     r12                         ; restore r12
     pop     rbx                         ; restore rbx
     ret                                 ; return rax = dst
+
+;==============================================================================
+; size_t asm_strlcpy(char *dst, const char *src, size_t size)
+;------------------------------------------------------------------------------
+; BSD strlcpy: copies at most size-1 bytes of src, always NUL-terminates when
+; size > 0, and returns strlen(src). Never reads or writes past dst[size-1].
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = dst  (char *)       - destination buffer
+;   rsi = src  (const char *) - source string
+;   rdx = size (size_t)       - total size of the destination buffer
+; Returns:
+;   rax = strlen(src)
+; Uses / clobbers:
+;   Pushes and restores rbx/r12/r13/r14 (callee-saved) and reserves 8 bytes
+;   to keep rsp 16-byte aligned at every call; calls asm_strlen and
+;   asm_memcpy; result in rax.
+;==============================================================================
+global asm_strlcpy:function             ; export asm_strlcpy as a function symbol
+asm_strlcpy:
+    ; ---- prologue: preserve callee-saved registers, align the stack ----
+    push    rbx                         ; preserve callee-saved registers
+    push    r12                         ; save r12 (callee-saved)
+    push    r13                         ; save r13 (callee-saved)
+    push    r14                         ; save r14 (callee-saved)
+    sub     rsp, 8                      ; keep the stack 16-byte aligned
+    mov     rbx, rdi                    ; rbx = dst
+    mov     r12, rsi                    ; r12 = src
+    mov     r13, rdx                    ; r13 = size
+    ; ---- measure src, then copy min(strlen, size-1) and terminate ------
+    mov     rdi, rsi                    ; first arg to strlen
+    call    asm_strlen                  ; rax = strlen(src)
+    mov     r14, rax                    ; r14 = strlen(src) (the return value)
+    test    r13, r13                    ; size == 0?
+    jz      .done                       ; yes: write nothing, just return length
+    mov     rdx, r13                    ; rdx = size
+    dec     rdx                         ; rdx = size - 1 (maximum copy)
+    cmp     r14, rdx                    ; strlen(src) < size - 1?
+    jb      .use_len                    ; yes: copy the whole string
+    ; ---- truncate: copy size-1 bytes (rdx already holds size-1) --------
+    mov     r13, rdx                    ; r13 = bytes to copy
+    jmp     .copy                       ; go copy
+.use_len:
+    mov     r13, r14                    ; r13 = bytes to copy = strlen(src)
+.copy:
+    mov     rdi, rbx                    ; destination
+    mov     rsi, r12                    ; source
+    mov     rdx, r13                    ; count
+    call    asm_memcpy                  ; copy the bytes
+    mov     byte [rbx+r13], 0           ; NUL-terminate at dst[copy]
+    ; ---- return strlen(src) --------------------------------------------
+.done:
+    mov     rax, r14                    ; return strlen(src)
+    add     rsp, 8                      ; undo the stack alignment adjustment
+    pop     r14                         ; restore r14
+    pop     r13                         ; restore r13
+    pop     r12                         ; restore r12
+    pop     rbx                         ; restore rbx
+    ret                                 ; return rax
+
+;==============================================================================
+; size_t asm_strlcat(char *dst, const char *src, size_t size)
+;------------------------------------------------------------------------------
+; BSD strlcat: appends at most size - strlen(dst) - 1 bytes of src, always
+; NUL-terminates, and returns min(size, strlen(dst)) + strlen(src). When no
+; NUL exists within the first size bytes of dst it writes nothing and returns
+; size + strlen(src). Never writes past dst[size-1].
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = dst  (char *)       - NUL-terminated destination string
+;   rsi = src  (const char *) - string to append
+;   rdx = size (size_t)       - total size of the destination buffer
+; Returns:
+;   rax = min(size, strlen(dst)) + strlen(src)
+; Uses / clobbers:
+;   Pushes and restores rbx/r12/r13/r14/r15 (callee-saved; five pushes keep
+;   rsp 16-byte aligned); calls asm_strnlen, asm_strlen and asm_memcpy;
+;   result in rax.
+;==============================================================================
+global asm_strlcat:function             ; export asm_strlcat as a function symbol
+asm_strlcat:
+    ; ---- prologue: preserve callee-saved registers ----
+    push    rbx                         ; preserve callee-saved registers
+    push    r12                         ; save r12 (callee-saved)
+    push    r13                         ; save r13 (callee-saved)
+    push    r14                         ; save r14 (callee-saved)
+    push    r15                         ; five pushes keep rsp 16-byte aligned
+    mov     rbx, rdi                    ; rbx = dst
+    mov     r12, rsi                    ; r12 = src
+    mov     r13, rdx                    ; r13 = size
+    ; ---- bounded dst length, then full src length ----------------------
+    mov     rdi, rbx                    ; first arg to strnlen
+    mov     rsi, r13                    ; second arg to strnlen (size)
+    call    asm_strnlen                 ; rax = min(strlen(dst), size)
+    mov     r14, rax                    ; r14 = bounded dst length
+    mov     rdi, r12                    ; first arg to strlen
+    call    asm_strlen                  ; rax = strlen(src)
+    mov     r15, rax                    ; r15 = strlen(src)
+    ; ---- if dst has no NUL within size, write nothing ------------------
+    cmp     r14, r13                    ; bounded length reached size?
+    jae     .done                       ; yes: no terminating NUL, no write
+    ; ---- append min(strlen(src), size - dlen - 1) and terminate --------
+    mov     rdx, r13                    ; rdx = size
+    sub     rdx, r14                    ; rdx = size - dlen
+    dec     rdx                         ; rdx = size - dlen - 1 (room)
+    cmp     r15, rdx                    ; strlen(src) < room?
+    jb      .use_len                    ; yes: append the whole string
+    ; ---- truncate: append only the room bytes --------------------------
+    mov     r13, rdx                    ; r13 = bytes to append
+    jmp     .copy                       ; go append
+.use_len:
+    mov     r13, r15                    ; r13 = bytes to append = strlen(src)
+.copy:
+    mov     rdi, rbx                    ; destination
+    add     rdi, r14                    ; start at dst + dlen
+    mov     rsi, r12                    ; source
+    mov     rdx, r13                    ; count
+    call    asm_memcpy                  ; append the bytes
+    lea     rdx, [r14+r13]              ; rdx = dlen + appended length
+    mov     byte [rbx+rdx], 0           ; NUL-terminate after the appended bytes
+    ; ---- return dlen + strlen(src) -------------------------------------
+.done:
+    lea     rax, [r14+r15]              ; return dlen + strlen(src)
+    pop     r15                         ; restore r15
+    pop     r14                         ; restore r14
+    pop     r13                         ; restore r13
+    pop     r12                         ; restore r12
+    pop     rbx                         ; restore rbx
+    ret                                 ; return rax
 
 GNU_STACK_NOTE                          ; mark the stack non-executable

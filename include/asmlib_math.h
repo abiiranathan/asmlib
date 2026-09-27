@@ -67,9 +67,18 @@ double ASM_MATH(logb)(double x);                    /* floor(log2(|x|)), as doub
 /* ---- arithmetic -------------------------------------------------------- */
 double ASM_MATH(fmod)(double x, double y);          /* truncated remainder        */
 double ASM_MATH(remainder)(double x, double y);     /* IEEE remainder (round-even)*/
+double ASM_MATH(remquo)(double x, double y, int *quo); /* remainder + quotient    */
 double ASM_MATH(sqrt)(double x);                    /* square root                */
 double ASM_MATH(cbrt)(double x);                    /* cube root                  */
 double ASM_MATH(hypot)(double x, double y);         /* sqrt(x*x + y*y), no overflow */
+
+/* ---- neighbouring values and integer conversion ------------------------ */
+double ASM_MATH(nextafter)(double x, double y);     /* next double toward y       */
+long   ASM_MATH(lrint)(double x);                   /* round nearest-even -> long */
+long long ASM_MATH(llrint)(double x);               /* round nearest-even -> ll   */
+long   ASM_MATH(lround)(double x);                  /* round away from zero->long */
+long long ASM_MATH(llround)(double x);              /* round away -> long long    */
+double ASM_MATH(nan)(const char *tag);              /* quiet NaN (tag ignored)    */
 
 /* ---- exponential and logarithmic -------------------------------------- */
 double ASM_MATH(exp)(double x);

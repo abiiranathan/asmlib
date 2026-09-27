@@ -4,9 +4,12 @@
 ; Implements AVX2-accelerated replacements for the hot libc memory routines:
 ;
 ;   void *asm_memcpy (void *dst, const void *src, size_t n);
+;   void *asm_mempcpy(void *dst, const void *src, size_t n);
+;   void *asm_memccpy(void *dst, const void *src, int c, size_t n);
 ;   void *asm_memmove(void *dst, const void *src, size_t n);
 ;   void *asm_memset (void *dst, int c, size_t n);
 ;   void *asm_bzero  (void *dst, size_t n);
+;   void  asm_explicit_bzero(void *dst, size_t n);
 ;   int   asm_memcmp (const void *a, const void *b, size_t n);
 ;   void *asm_memchr (const void *s, int c, size_t n);
 ;   void *asm_memrchr(const void *s, int c, size_t n);
@@ -234,6 +237,95 @@ asm_memcpy:
     vmovdqu [rdi+rdx-32], ymm3          ; store bytes n-32 .. n-1
     vzeroupper                          ; drop AVX state
     ret                                 ; return dst (rax)
+
+;==============================================================================
+; void *asm_mempcpy(void *dst, const void *src, size_t n)
+;------------------------------------------------------------------------------
+; Copies exactly n non-overlapping bytes from src to dst, like asm_memcpy, and
+; returns dst + n (a pointer just past the last byte written).
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = dst (void *)         - destination buffer start
+;   rsi = src (const void *)   - source buffer start
+;   rdx = n   (size_t)         - number of bytes to copy
+; Returns:
+;   rax = dst + n (a pointer just past the copied region)
+; Uses / clobbers:
+;   Pushes and restores rbx (callee-saved); forwards rdi/rsi/rdx to
+;   asm_memcpy, so it inherits that routine's clobbers of rax/rcx/r8 and
+;   xmm0-1/ymm0-7. No other callee-saved register is touched.
+;==============================================================================
+global asm_mempcpy:function
+asm_mempcpy:
+    ; ---- remember dst + n across the copy ------------------------------
+    push    rbx                         ; preserve callee-saved rbx
+    mov     rbx, rdi                    ; rbx = dst
+    add     rbx, rdx                    ; rbx = dst + n (the return value)
+    call    asm_memcpy                  ; copy the bytes, rax = dst
+    mov     rax, rbx                    ; return dst + n
+    pop     rbx                         ; restore callee-saved rbx
+    ret                                 ; return dst + n in rax
+
+;==============================================================================
+; void *asm_memccpy(void *dst, const void *src, int c, size_t n)
+;------------------------------------------------------------------------------
+; Copies bytes from src to dst, stopping after the first byte equal to
+; (unsigned char)c. Returns a pointer just past that byte in dst, or NULL if
+; none of the first n bytes equals c. Never reads or writes past the n-byte
+; source/destination windows. Built on the bounded asm_memchr plus asm_memcpy.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = dst (void *)         - destination buffer start
+;   rsi = src (const void *)   - source buffer start
+;   edx = c   (int)            - stop byte; only the low 8 bits are used
+;   rcx = n   (size_t)         - maximum number of bytes to copy
+; Returns:
+;   rax = pointer to the byte just past the copy of the first c in dst,
+;         or NULL when c does not occur in the first n source bytes
+; Uses / clobbers:
+;   Pushes and restores rbx/r12/r13 (callee-saved; three pushes keep rsp
+;   16-byte aligned at every call); calls asm_memchr and asm_memcpy,
+;   inheriting their clobbers. Result in rax.
+;==============================================================================
+global asm_memccpy:function
+asm_memccpy:
+    ; ---- prologue: preserve the arguments across the helper calls ------
+    push    rbx                         ; preserve callee-saved rbx
+    push    r12                         ; preserve callee-saved r12
+    push    r13                         ; preserve callee-saved r13 (3 pushes align rsp)
+    mov     rbx, rdi                    ; rbx = dst
+    mov     r12, rsi                    ; r12 = src
+    mov     r13, rcx                    ; r13 = n
+    ; ---- locate the first c within the first n source bytes ------------
+    mov     rdi, rsi                    ; arg0 = src
+    mov     esi, edx                    ; arg1 = c
+    mov     rdx, rcx                    ; arg2 = n
+    call    asm_memchr                  ; rax = first match, or NULL
+    test    rax, rax                    ; did we find c?
+    jz      .not_found                  ; no: copy all n bytes, return NULL
+    ; ---- copy through the matching byte ---------------------------------
+    sub     rax, r12                    ; rax = index of the first c
+    inc     rax                         ; rax = bytes to copy (index + 1)
+    mov     r13, rax                    ; r13 = bytes to copy
+    mov     rdi, rbx                    ; destination
+    mov     rsi, r12                    ; source
+    mov     rdx, r13                    ; count
+    call    asm_memcpy                  ; copy src[0 .. index]
+    lea     rax, [rbx+r13]              ; return dst + bytes copied
+    jmp     .done                       ; common epilogue
+    ; ---- c absent: copy the whole window and report no match -----------
+.not_found:
+    mov     rdi, rbx                    ; destination
+    mov     rsi, r12                    ; source
+    mov     rdx, r13                    ; count = n
+    call    asm_memcpy                  ; copy all n bytes
+    xor     eax, eax                    ; return NULL
+    ; ---- epilogue: restore the saved registers -------------------------
+.done:
+    pop     r13                         ; restore r13
+    pop     r12                         ; restore r12
+    pop     rbx                         ; restore rbx
+    ret                                 ; return rax
 
 ;==============================================================================
 ; void *asm_memmove(void *dst, const void *src, size_t n)
@@ -464,6 +556,32 @@ asm_memset:
 global asm_bzero:function
 asm_bzero:
     ; ---- forward bzero to asm_memset with c == 0 -----------------------
+    mov     rdx, rsi                    ; third arg (n) = old second arg
+    xor     esi, esi                    ; fill byte = 0
+    jmp     asm_memset                  ; tail-call the shared implementation
+
+;==============================================================================
+; void asm_explicit_bzero(void *dst, size_t n)
+;------------------------------------------------------------------------------
+; Zeroes n bytes at dst like asm_bzero, but the stores must not be elided.
+; Because this is a real out-of-line function (not a macro and not inline),
+; the call is an opaque memory clobber from the caller's point of view, so a
+; compiler may not discard it as dead code. Implemented as a tail-call to
+; asm_memset with c == 0.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = dst (void *)         - destination buffer start
+;   rsi = n   (size_t)         - number of bytes to zero
+; Returns:
+;   none
+; Uses / clobbers:
+;   Reads rdi/rsi; rewrites rdx/rsi and (via asm_memset) rax/rcx/r8/r9 and
+;   xmm0/ymm0. All xmm/ymm are caller-saved; no callee-saved register is
+;   touched.
+;==============================================================================
+global asm_explicit_bzero:function
+asm_explicit_bzero:
+    ; ---- forward to asm_memset with c == 0 -----------------------------
     mov     rdx, rsi                    ; third arg (n) = old second arg
     xor     esi, esi                    ; fill byte = 0
     jmp     asm_memset                  ; tail-call the shared implementation

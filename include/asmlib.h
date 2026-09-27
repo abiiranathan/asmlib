@@ -57,6 +57,13 @@ int asm_cpu_has_avx2(void);
 /* Copy n bytes from src to dst (must not overlap). Returns dst. */
 void* asm_memcpy(void* dst, const void* src, size_t n);
 
+/* Copy n bytes from src to dst (must not overlap). Returns dst + n. */
+void* asm_mempcpy(void* dst, const void* src, size_t n);
+
+/* Copy up to n bytes from src to dst, stopping after the byte equal to
+ * (unsigned char)c. Returns a pointer just past that byte in dst, or NULL. */
+void* asm_memccpy(void* dst, const void* src, int c, size_t n);
+
 /* Copy n bytes from src to dst; the regions may overlap. Returns dst. */
 void* asm_memmove(void* dst, const void* src, size_t n);
 
@@ -65,6 +72,9 @@ void* asm_memset(void* dst, int c, size_t n);
 
 /* Zero n bytes at dst. Returns dst. */
 void* asm_bzero(void* dst, size_t n);
+
+/* Zero n bytes at dst; the out-of-line call cannot be elided by the compiler. */
+void asm_explicit_bzero(void* dst, size_t n);
 
 /* Compare n bytes. Returns <0, 0 or >0 using unsigned byte values. */
 int asm_memcmp(const void* a, const void* b, size_t n);
@@ -90,10 +100,23 @@ size_t asm_strnlen(const char* s, size_t maxlen);
  * this can never copy an unbounded amount into dst. */
 char* asm_strncpy(char* dst, const char* src, size_t n);
 
+/* Like asm_strncpy, but returns the terminating NUL when one was written,
+ * otherwise dst + n (POSIX stpncpy). */
+char* asm_stpncpy(char* dst, const char* src, size_t n);
+
 /* Append at most n bytes of src, then NUL-terminate. Returns dst.
  * The number of bytes appended is bounded by n; unlike asm_strcat (removed),
  * this can never append an unbounded amount into dst. */
 char* asm_strncat(char* dst, const char* src, size_t n);
+
+/* BSD bounded copy: at most size-1 bytes and always NUL-terminated when
+ * size > 0; never writes past dst[size-1]. Returns strlen(src). */
+size_t asm_strlcpy(char* dst, const char* src, size_t size);
+
+/* BSD bounded append: appends at most size-strlen(dst)-1 bytes, terminates,
+ * and never writes past dst[size-1]. Returns min(size, strlen(dst)) +
+ * strlen(src); when dst has no NUL within size it writes nothing. */
+size_t asm_strlcat(char* dst, const char* src, size_t size);
 
 /*==============================================================================
  * String comparison (strcmp.asm)
@@ -280,16 +303,22 @@ void asm_free(void* ptr);
  *============================================================================*/
 #ifdef ASMLIB_ENABLE_LIBC_ALIASES
 #define memcpy      asm_memcpy
+#define mempcpy     asm_mempcpy
+#define memccpy     asm_memccpy
 #define memmove     asm_memmove
 #define memset      asm_memset
 #define bzero       asm_bzero
+#define explicit_bzero asm_explicit_bzero
 #define memcmp      asm_memcmp
 #define memchr      asm_memchr
 #define memrchr     asm_memrchr
 #define strlen      asm_strlen
 #define strnlen     asm_strnlen
 #define strncpy     asm_strncpy
+#define stpncpy     asm_stpncpy
 #define strncat     asm_strncat
+#define strlcpy     asm_strlcpy
+#define strlcat     asm_strlcat
 #define strcmp      asm_strcmp
 #define strncmp     asm_strncmp
 #define strcasecmp  asm_strcasecmp

@@ -20,7 +20,7 @@ examples/   a practical word-frequency analyser built on asmlib
 ## Highlights
 
 * **Memory, string, comparison, search, ctype, an arena allocator and a
-  malloc-style heap** — 61 routines in all, no libc dependency anywhere.
+  malloc-style heap** — 67 routines in all, no libc dependency anywhere.
 * **AVX2 / BMI1 / BMI2** where they win: 32-byte vector scans, `tzcnt`/`bsr`
   bit-indexing, branchless ASCII case folding.
 * **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64) let
@@ -31,7 +31,7 @@ examples/   a practical word-frequency analyser built on asmlib
   exist for.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
   `mmap`; 6–12x faster than glibc's allocator for burst workloads.
-* **Freestanding math library** for WebAssembly and bare-metal targets: 44
+* **Freestanding math library** for WebAssembly and bare-metal targets: 51
   double-precision routines (`sin`, `log`, `pow`, `cbrt`, …) in portable C
   with no libc, no `libm`, no `errno` and no global state, differential-tested
   against the host `libm` and broadly at glibc speed.
@@ -39,7 +39,7 @@ examples/   a practical word-frequency analyser built on asmlib
   length or a naturally aligned vector load that cannot straddle a page.
   A dedicated guard-page test proves this by placing buffers against a
   `PROT_NONE` page.
-* **Differential tested**: 3M+ checks pass against the host libc over
+* **Differential tested**: 7M+ checks pass against the host libc over
   exhaustive and randomised inputs, including all alignments and edge sizes.
 * **Two usage modes**: call the `asm_*` names, or define
   `ASMLIB_ENABLE_LIBC_ALIASES` to transparently replace the standard names.
@@ -107,16 +107,21 @@ To replace libc transparently in an existing source file:
 |---|---|
 | `void *asm_memcpy(void *dst, const void *src, size_t n)` | non-overlapping |
 | `void *asm_memmove(void *dst, const void *src, size_t n)` | overlap-safe |
+| `void *asm_mempcpy(void *dst, const void *src, size_t n)` | returns `dst + n` |
+| `void *asm_memccpy(void *dst, const void *src, int c, size_t n)` | stops after `c` |
 | `void *asm_memset(void *dst, int c, size_t n)` | |
 | `void *asm_bzero(void *dst, size_t n)` | |
+| `void asm_explicit_bzero(void *dst, size_t n)` | secure zero, never elided |
 | `int asm_memcmp(const void *a, const void *b, size_t n)` | unsigned bytes |
 | `void *asm_memchr(const void *s, int c, size_t n)` | first match |
 | `void *asm_memrchr(const void *s, int c, size_t n)` | last match |
 
 ### String (`string.asm`)
-`asm_strlen`, `asm_strnlen`, `asm_strncpy`, `asm_strncat`.
+`asm_strlen`, `asm_strnlen`, `asm_strncpy`, `asm_strncat`, `asm_stpncpy`,
+`asm_strlcpy`, `asm_strlcat`.
 The unbounded `strcpy`, `stpcpy` and `strcat` are deliberately not provided;
-use the length-bounded variants so a destination buffer cannot be overrun.
+use the length-bounded `strlcpy`/`strlcat` or `strncpy`/`strncat` so a
+destination buffer cannot be overrun.
 
 ### Comparison (`strcmp.asm`)
 `asm_strcmp`, `asm_strncmp`, `asm_strcasecmp`, `asm_strncasecmp`
@@ -220,9 +225,10 @@ resulting module can be linked anywhere that expects `sin`, `log`, `pow`, ….
 | Rounding | `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` |
 | Decompose / scale | `frexp`, `modf`, `ldexp`, `scalbn`, `ilogb`, `logb` |
 | Arithmetic | `fmod`, `remainder`, `sqrt`, `cbrt`, `hypot` |
-| Exponential / log | `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `pow` |
+| Exp / log / pow | `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `pow` |
 | Trig / inverse | `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2` |
 | Hyperbolic / inverse | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
+| Step / integer / misc | `nextafter`, `remquo`, `lrint`, `llrint`, `lround`, `llround`, `nan` |
 
 All routines take and return IEEE-754 binary64. Results are **faithful**: every
 routine is within 1 ulp of the true result, except `sinh` and `tanh`, which

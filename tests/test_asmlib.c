@@ -52,6 +52,45 @@ static uint64_t rng(void) {
 }
 
 /*------------------------------------------------------------------------------
+ * strlcpy/strlcat host reference
+ *------------------------------------------------------------------------------
+ * glibc gained strlcpy/strlcat in 2.38; on older libcs fall back to a small
+ * local reference so the differential tests always have a baseline. */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 38)
+static size_t host_strlcpy(char *dst, const char *src, size_t size) {
+    return strlcpy(dst, src, size);
+}
+static size_t host_strlcat(char *dst, const char *src, size_t size) {
+    return strlcat(dst, src, size);
+}
+#else
+static size_t ref_strlcpy(char *dst, const char *src, size_t size) {
+    size_t srclen = strlen(src);
+    if (size != 0) {
+        size_t copy = (srclen < size - 1) ? srclen : size - 1;
+        memcpy(dst, src, copy);
+        dst[copy] = '\0';
+    }
+    return srclen;
+}
+static size_t ref_strlcat(char *dst, const char *src, size_t size) {
+    size_t dlen = strnlen(dst, size);
+    size_t slen = strlen(src);
+    if (dlen == size) return size + slen;
+    size_t copy = (slen < size - dlen - 1) ? slen : size - dlen - 1;
+    memcpy(dst + dlen, src, copy);
+    dst[dlen + copy] = '\0';
+    return dlen + slen;
+}
+static size_t host_strlcpy(char *dst, const char *src, size_t size) {
+    return ref_strlcpy(dst, src, size);
+}
+static size_t host_strlcat(char *dst, const char *src, size_t size) {
+    return ref_strlcat(dst, src, size);
+}
+#endif
+
+/*------------------------------------------------------------------------------
  * Fault trapping: run an expression and report whether it touched a guard page.
  *----------------------------------------------------------------------------*/
 static sigjmp_buf g_jmp;
@@ -129,6 +168,35 @@ static void test_memory(void) {
                 CHECK(asm_memrchr(p, ch, n) == memrchr(p, ch, n), "memrchr");
             }
         }
+        /* mempcpy: copy n bytes and return dst + n */
+        {
+            unsigned char *p1 = (unsigned char *)asm_mempcpy(d1 + 20, src, n);
+            unsigned char *p2 = (unsigned char *)mempcpy(d2 + 20, src, n);
+            CHECK(p1 == d1 + 20 + n, "mempcpy-ptr");
+            CHECK((size_t)(p2 - (d2 + 20)) == (size_t)(p1 - (d1 + 20)), "mempcpy-host");
+            CHECK(memcmp(d1 + 20, d2 + 20, n) == 0, "mempcpy");
+        }
+        /* memccpy: stop after the first matching byte, return just past it */
+        for (int t = 0; t < 4; t++) {
+            int ch = (t == 0) ? 0 : (int)(rng() & 0xFF);
+            unsigned char *p1 = (unsigned char *)asm_memccpy(d1, src, ch, n);
+            unsigned char *p2 = (unsigned char *)memccpy(d2, src, ch, n);
+            size_t k1 = p1 ? (size_t)(p1 - d1) : n;
+            size_t k2 = p2 ? (size_t)(p2 - d2) : n;
+            CHECK((p1 == NULL) == (p2 == NULL), "memccpy-null");
+            CHECK(k1 == k2, "memccpy-ptr");
+            CHECK(memcmp(d1, d2, k1) == 0, "memccpy");
+        }
+        /* explicit_bzero: must really zero, matching libc's effect */
+        {
+            unsigned char z1[800], z2[800];
+            memset(z1, 0xEE, sizeof z1);
+            memset(z2, 0xEE, sizeof z2);
+            asm_explicit_bzero(z1 + 30, n);
+            explicit_bzero(z2 + 30, n);
+            CHECK(memcmp(z1, z2, sizeof z1) == 0, "explicit_bzero");
+            CHECK(z1[30 + n] == 0xEE, "explicit_bzero-edge");
+        }
     }
     free(base);
 }
@@ -196,6 +264,14 @@ static void test_string(void) {
                 strncpy(d2, s, n);
                 CHECK(memcmp(d1, d2, 600) == 0, "strncpy");
             }
+            /* stpncpy: NUL-padded copy returning the terminating NUL/dst+n */
+            for (size_t n = 0; n <= len + 3 && n < 600; n++) {
+                memset(d1, 0x7E, sizeof d1); memset(d2, 0x7E, sizeof d2);
+                char *p1 = asm_stpncpy(d1, s, n);
+                char *p2 = stpncpy(d2, s, n);
+                CHECK((size_t)(p1 - d1) == (size_t)(p2 - d2), "stpncpy-ptr");
+                CHECK(memcmp(d1, d2, 600) == 0, "stpncpy");
+            }
             /* strcat / strncat */
             for (size_t n = 0; n <= len + 3 && n < 300; n++) {
                 memset(d1, 0x55, sizeof d1); memset(d2, 0x55, sizeof d2);
@@ -203,6 +279,39 @@ static void test_string(void) {
                 asm_strncat(d1, s, n);
                 strncat(d2, s, n);
                 CHECK(memcmp(d1, d2, 700) == 0, "strncat");
+            }
+            /* strlcpy: bounded copy returning strlen(src) */
+            for (size_t sz = 0; sz <= len + 3 && sz < 600; sz++) {
+                memset(d1, 0x7E, sizeof d1); memset(d2, 0x7E, sizeof d2);
+                size_t r1 = asm_strlcpy(d1, s, sz);
+                size_t r2 = host_strlcpy(d2, s, sz);
+                CHECK(r1 == r2, "strlcpy-ret");
+                CHECK(memcmp(d1, d2, sizeof d1) == 0, "strlcpy");
+            }
+        }
+    }
+}
+
+/*------------------------------------------------------------------------------
+ * strlcat - differential append, including the no-NUL-within-size truncation
+ *----------------------------------------------------------------------------*/
+static void test_strlcat(void) {
+    char src[300], d1[512], d2[512];
+    memset(src, 0x7A, sizeof src);
+    for (size_t len = 0; len < 200; len += 7) {
+        for (size_t i = 0; i < len; i++) src[i] = (char)(1 + (rng() % 120));
+        src[len] = 0;
+        for (size_t dlen = 0; dlen <= 24; dlen++) {
+            for (size_t sz = 0; sz <= 48; sz++) {
+                memset(d1, 0x55, sizeof d1);
+                memset(d2, 0x55, sizeof d2);
+                for (size_t i = 0; i < dlen; i++)
+                    d1[i] = d2[i] = (char)('a' + (i % 26));
+                d1[dlen] = d2[dlen] = 0;
+                size_t r1 = asm_strlcat(d1, src, sz);
+                size_t r2 = host_strlcat(d2, src, sz);
+                CHECK(r1 == r2, "strlcat-ret");
+                CHECK(memcmp(d1, d2, sizeof d1) == 0, "strlcat");
             }
         }
     }
@@ -346,11 +455,25 @@ static void test_guards(void) {
     }
 
     /* ---- writes ending exactly at the guard -----------------------------*/
+    /* A long source with no NUL inside the first page, so the bounded writers
+     * really do write every one of the n bytes. */
+    memset(region, 'A', (size_t)ps);
+    size_t rlen = strlen((char *)region);
     for (volatile size_t n = 1; n < 400; n += 5) {
         unsigned char *d = limit - n;
         CHECK(NO_FAULT(asm_memset(d, 0xAB, n) == d), "guard memset");
         CHECK(NO_FAULT(asm_memcpy(d, region, n) == d), "guard memcpy");
         CHECK(NO_FAULT(asm_bzero(d, n) == d), "guard bzero");
+        CHECK(NO_FAULT(asm_mempcpy(d, region, n) == d + n), "guard mempcpy");
+        /* c = NUL is absent from the source window: copy all n, return NULL */
+        CHECK(NO_FAULT(asm_memccpy(d, region, 0, n) == NULL), "guard memccpy");
+        /* no NUL in n bytes: stpncpy writes exactly n bytes, returns dst + n */
+        CHECK(NO_FAULT(asm_stpncpy((char *)d, (char *)region, n) == (char *)d + n), "guard stpncpy");
+        /* strlcpy: copies n-1 bytes and puts the NUL in dst[size-1] */
+        CHECK(NO_FAULT(asm_strlcpy((char *)d, (char *)region, n) == rlen), "guard strlcpy");
+        /* strlcat from an empty dst: appends n-1 bytes, NUL in dst[size-1] */
+        d[0] = 0;
+        CHECK(NO_FAULT(asm_strlcat((char *)d, (char *)region, n) == rlen), "guard strlcat");
     }
 
     sigaction(SIGSEGV, &old, NULL);
@@ -374,6 +497,7 @@ int main(void) {
     test_memory();  printf("   memory   done\n");
     test_large();   printf("   large    done\n");
     test_string();  printf("   string   done\n");
+    test_strlcat(); printf("   strlcat  done\n");
     test_compare(); printf("   compare  done\n");
     test_search();  printf("   search   done\n");
     test_ctype();   printf("   ctype    done\n");
