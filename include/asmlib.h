@@ -1,16 +1,19 @@
 /*==============================================================================
- * asmlib.h - public C interface to the x86-64 NASM assembly library
+ * asmlib.h - public C interface to the asmlib memory/string library
  *------------------------------------------------------------------------------
  * SPDX-License-Identifier: MIT
  *
  * A drop-in, high-performance replacement for the hottest libc memory and
- * string routines, implemented in hand-written AVX2/BMI2 assembly.
+ * string routines, implemented in hand-written x86-64 (AVX2/BMI2) and
+ * AArch64 (NEON) assembly, all behind the asm_* names below.
  *
  * Requirements
  * ------------
- *   - x86-64 (System V AMD64 ABI: Linux, *BSD, macOS).
- *   - AVX2 and BMI1 (tzcnt) at run time. Query asm_cpu_has_avx2() before
- *     calling any of the vectors if you must support older CPUs.
+ *   - x86-64 (System V AMD64 ABI: Linux, *BSD, macOS) with AVX2 and BMI1
+ *     (tzcnt) at run time. Query asm_cpu_has_avx2() before calling any of the
+ *     vectors if you must support older CPUs.
+ *   - AArch64 (AAPCS64: Linux); NEON is baseline, so no feature check is
+ *     needed (asm_cpu_has_avx2() returns 0 there).
  *
  * Linking
  * -------

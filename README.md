@@ -1,11 +1,14 @@
-# asmlib — a high-performance x86-64 assembly replacement for libc string/memory routines
+# asmlib — hand-written x86-64 and AArch64 assembly, plus a freestanding wasm build
 
 [![CI](https://github.com/abiiranathan/asmlib/actions/workflows/ci.yml/badge.svg)](https://github.com/abiiranathan/asmlib/actions/workflows/ci.yml)
 
-`asmlib` is a hand-written NASM library for x86-64 (System V AMD64 ABI) that
-replaces the hottest C library memory and string functions with AVX2/BMI2
-implementations. It is small, self-contained (no dependencies beyond the
-assembler and linker), thoroughly tested against libc, and packaged with a C
+`asmlib` replaces the hottest C library memory, string, comparison, search,
+ctype and allocator routines with hand-written assembly — twice over: an x86-64
+backend (NASM, AVX2/BMI2) and an AArch64 backend (GNU assembly, NEON), exposing
+the same `asm_*` API. A portable C backend (`src/libc/`) and a libc-free math
+library (`src/math/`) bring that same surface to WebAssembly and other
+freestanding targets. It is small, self-contained (nothing beyond the assembler,
+compiler and linker), thoroughly tested against libc, and packaged with a C
 header plus static and shared libraries.
 
 ```
@@ -16,23 +19,37 @@ src/libc/   portable C memory/string/allocator backend for wasm/freestanding
 include/    asmlib.h — the public C API; asmlib_math.h — the math API
 tests/      differential + page-boundary + arena + malloc + math + portable suites
 bench/      asmlib vs. libc micro-benchmarks, arena/malloc vs. malloc
-examples/   a practical word-frequency analyser built on asmlib
+examples/   word-frequency analyser and the wasm double-pendulum demo
 ```
+
+## Platforms
+
+| Target | Backend | Toolchain |
+|---|---|---|
+| x86-64 (System V AMD64) | `src/*.asm` — NASM, AVX2/BMI | NASM 2.14+ (3.02 tested), C compiler, `ar`, GNU `ld` |
+| AArch64 (AAPCS64) | `src/aarch64/*.S` — GNU assembly, NEON | `aarch64-linux-gnu-gcc`; `qemu-aarch64-static` to run the tests |
+| WebAssembly (wasm32) | `src/libc/` + `src/math/` — portable C | `clang --target=wasm32-unknown-unknown`, `wasm-ld` |
+| other freestanding | `src/libc/` + `src/math/` — portable C | any C11 compiler |
+
+The x86-64 and AArch64 backends expose the identical `asm_*` API (71 symbols
+each) and are validated by the same differential suites; WebAssembly and other
+freestanding targets get the memory/string/allocator API plus the math library.
 
 ## Highlights
 
 * **Memory, string, comparison, search, ctype, an arena allocator and a
   malloc-style heap** — 71 routines in all, no libc dependency anywhere.
-* **AVX2 / BMI1 / BMI2** where they win: 32-byte vector scans, `tzcnt`/`bsr`
-  bit-indexing, branchless ASCII case folding.
-* **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64) let
-  both the arena and the malloc heap obtain memory with no libc and no
-  caller-supplied allocator.
+* **SIMD where it wins.** 32-byte AVX2/BMI scans (`vpsubb`, `vpminub`,
+  `tzcnt`/`bsr`) on x86-64 and NEON (`cmeq`/`umaxv`, `ldp`/`stp`) on AArch64,
+  both with branchless ASCII case folding.
+* **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64 and
+  AArch64) let both the arena and the malloc heap obtain memory with no libc
+  and no caller-supplied allocator.
 * **Chunked, resettable arena allocator** with alignment, mark/release and
-  optional growth. 8–34x faster than `malloc`/`free` for the bursts arenas
-  exist for.
+  optional growth. 3–19x faster than `malloc`/`free` for the bursts arenas
+  exist for, and ~33x faster for a bulk reset of thousands of blocks.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
-  `mmap`; 6–12x faster than glibc's allocator for burst workloads.
+  `mmap`; up to about 4x faster than glibc's allocator for burst workloads.
 * **Freestanding math library** for WebAssembly and bare-metal targets: 112
   double- and single-precision routines (`sin`/`sinf`, `log`/`logf`,
   `pow`/`powf`, `cbrt`, `erf`, …) in portable C with no libc, no `libm`, no
@@ -46,27 +63,29 @@ examples/   a practical word-frequency analyser built on asmlib
   exhaustive and randomised inputs, including all alignments and edge sizes.
 * **Two usage modes**: call the `asm_*` names, or define
   `ASMLIB_ENABLE_LIBC_ALIASES` to transparently replace the standard names.
-* **Two architectures**: the hand-written assembly is available for x86-64
-  (NASM, AVX2) and AArch64 (GNU as, NEON), exposing the same `asm_*` API; the
-  AArch64 build is cross-compiled and verified under QEMU in CI.
-* **WebAssembly-ready.** A portable C backend (`src/libc/`) brings the memory,
-  string and allocator API to freestanding targets, and `make wasm` links it
-  with the math library into `build/asmlib.wasm` — a no-import module exporting
-  the standard libc/libm names.
+* **Three portability tiers**: native x86-64 (NASM) and AArch64 (GNU as)
+  assembly behind one `asm_*` API — the AArch64 build is cross-compiled and run
+  under QEMU in CI — plus a portable C backend (`src/libc/`) for WebAssembly and
+  other freestanding targets.
+* **WebAssembly-ready**: `make wasm` links the portable backend with the math
+  library into `build/asmlib.wasm`, a no-import module exporting the standard
+  libc/libm names.
 
-## Requirements
+## Runtime requirements
 
-* x86-64 CPU with **AVX2** and **BMI1** (`tzcnt`). The library does not fall
-  back to scalar code, so query support first if you must run on older CPUs:
-  the native math kernels are also compiled with FMA (`-mfma`), which is
-  implied by AVX2 on every real CPU; the wasm32 build uses no FMA.
+On x86-64 the library requires **AVX2** and **BMI1** (`tzcnt`) at run time and
+does not fall back to scalar code, so query support before using it on older
+CPUs:
 
-  ```c
-  #include "asmlib.h"
-  if (!asm_cpu_has_avx2()) { /* use libc instead */ }
-  ```
+```c
+#include "asmlib.h"
+if (!asm_cpu_has_avx2()) { /* use libc instead */ }
+```
 
-* NASM 2.14+ (developed with 3.02), a C compiler, `ar`, and GNU `ld`.
+The native math kernels additionally use FMA (`-mfma`), which AVX2 implies on
+every real CPU; the wasm32 build uses no FMA. On AArch64, NEON is part of the
+baseline ISA, so no feature check is needed — `asm_cpu_has_avx2()` returns 0
+there by design.
 
 ## Build
 
@@ -301,9 +320,13 @@ so it is a drop-in freestanding libm + libc subset for WebAssembly.
 
 ## Design notes
 
-* **ABI.** All routines follow the System V AMD64 ABI. The leaf routines use
-  only caller-saved registers; the wrappers that call other routines preserve
-  `rbx`/`r12`–`r15` and keep the stack 16-byte aligned at every `call`.
+The notes below describe the x86-64 backend; the AArch64 port mirrors the same
+design using NEON and AAPCS64 (see [AArch64 port](#aarch64-port)).
+
+* **ABI.** On x86-64, all routines follow the System V AMD64 ABI. The leaf
+  routines use only caller-saved registers; the wrappers that call other
+  routines preserve `rbx`/`r12`–`r15` and keep the stack 16-byte aligned at
+  every `call`.
 * **`vzeroupper`.** Every path that executes AVX instructions issues
   `vzeroupper` before returning, avoiding AVX→SSE transition penalties in the
   caller.
@@ -352,9 +375,10 @@ so it is a drop-in freestanding libm + libc subset for WebAssembly.
   first in one pass; a `mark` records the chunk, pointer and byte count so
   `release` can rewind and reclaim precisely. The free callback receives the
   chunk's backing size so `munmap` can unmap it exactly.
-* **OS memory and the malloc heap.** `sys.asm` holds the only platform
-  specific code — raw `mmap`/`munmap` syscalls (Linux x86-64). `alloc.asm`
-  builds `malloc`/`calloc`/`realloc`/`free` on top: requests up to 4080 bytes
+* **OS memory and the malloc heap.** The only platform-specific code is the
+  raw `mmap`/`munmap` syscall layer — `src/sys.asm` on Linux x86-64,
+  `src/aarch64/sys.S` on Linux AArch64. `alloc` builds
+  `malloc`/`calloc`/`realloc`/`free` on top: requests up to 4080 bytes
   are rounded to a 16-byte size class and served from a per-class free list
   replenished by a slab run; larger requests get their own page-rounded
   mapping. Every block is 16-byte aligned and carries a 16-byte header with
@@ -363,22 +387,25 @@ so it is a drop-in freestanding libm + libc subset for WebAssembly.
 
 ### Performance approach
 
-`strlen` reduces eight aligned vectors per iteration with a `vpminub` tree
-(4 ALU ops per 128 bytes instead of 7), `memcmp` and `memcpy` unroll to 256
-bytes, `strcasecmp` folds 32 bytes per AVX2 step, and small
-`memchr`/`memcmp` sizes use overlapping page-safe vector windows rather than
-byte loops. Against glibc the memory routines are at or near parity, `memchr`
-is consistently faster, `memmem` is several times faster than libc's, and the
-case-insensitive compares went from 20-50x slower to parity for short strings
-and about 0.5-0.8x for long ones. `strstr` (which glibc implements with a
-dedicated two-way algorithm) is within roughly 0.6-0.8x.
+The x86-64 backend reduces eight aligned vectors per iteration in `strlen`
+with a `vpminub` tree (4 ALU ops per 128 bytes instead of 7), unrolls `memcmp`
+and `memcpy` to 256 bytes, folds 32 bytes per AVX2 step in `strcasecmp`, and
+uses overlapping page-safe vector windows for small `memchr`/`memcmp` sizes
+instead of byte loops. The AArch64 port mirrors these choices in NEON
+(`cmeq`/`umaxv` reductions, `ldp`/`stp` block moves).
+
+Measured against glibc 2.44 on the development machine, `memchr` is
+consistently faster (≈1.1–1.2x from 128 bytes up) and mid/large `memcpy`,
+`memset` and `memcmp` are at parity (≈0.95–1.2x). glibc keeps the edge on
+`strlen` (≈0.5–0.8x under 64 KiB) and on its two-way `strstr` (≈0.4–0.65x),
+and `memmem` is several times faster than libc's.
 
 ## Testing
 
 `make test` runs `tests/test_asmlib.c`, which:
 
 1. compares every routine against its libc counterpart across sizes, offsets
-   and random contents (about 3 million assertions);
+   and random contents (about 7.5 million checks);
 2. exercises all small sizes and valid alignments, including `n == 0`;
 3. mmaps buffers so their final byte abuts a `PROT_NONE` guard page and
    catches any `SIGSEGV` with a handler, proving there are no out-of-bounds
@@ -426,12 +453,11 @@ harness bug where a string pointer was offset past the terminating NUL.
 
 `make bench` reports nanoseconds/call for asmlib vs. glibc and the speedup
 (`> 1.00x` means asmlib is faster). Results are hardware-dependent and noisy;
-on the development machine (Intel Comet Lake, glibc 2.44) the library is now
-broadly at parity: `memchr` is consistently faster, mid/large `memcpy`,
-`memset` and `memcmp` are around 1.0x, and glibc remains somewhat ahead on
-the most heavily optimised `strstr` (two-way) and on the smallest sizes where
-call overhead dominates. The benchmark makes the trade-offs visible and
-guards against regressions.
+on the development machine (Intel Comet Lake, glibc 2.44) `memchr` is
+consistently faster and mid/large `memcpy`, `memset` and `memcmp` are at
+parity, while glibc keeps an edge on `strlen` and on its heavily optimised
+two-way `strstr`. The benchmark makes the trade-offs visible and guards
+against regressions.
 
 `make bench-arena` (alias `make bench-alloc`) compares the arena and the
 malloc heap against glibc `malloc`/`free`. Both use only raw `mmap` — there is
@@ -440,12 +466,12 @@ ns per operation):
 
 ```
 workload                              asm       malloc   speedup
-arena   1000 x 64B                   3.54        29.06     8.22x
-arena   4000 mixed 8..512B           3.35        62.24    18.60x
-arena   1000 x 64B +memset           5.16        30.76     5.96x
-malloc  1000 x 64B                   5.07        29.20     5.76x
-malloc  4000 mixed 8..512B           5.80        69.72    12.01x
-2048 x 1KiB fill+release (us)        15.40       521.73    33.87x
+arena   1000 x 64B                   3.05        26.07     8.55x
+arena   4000 mixed 8..512B           3.04        56.81    18.72x
+arena   1000 x 64B +memset           8.24        27.77     3.37x
+malloc  1000 x 64B                  14.78        26.02     1.76x
+malloc  4000 mixed 8..512B          14.48        53.41     3.69x
+2048 x 1KiB fill+release (us)        13.27       435.26    32.80x
 ```
 
 The arena wins because allocation is a pointer bump, the memory is contiguous
@@ -461,32 +487,33 @@ development machine (glibc 2.44):
 
 ```
 function         libm     asmlib   speedup
-sqrt             2.18       2.15     1.01x
-cbrt            21.98      10.67     2.06x
-fmod            13.72      14.72     0.93x
-exp              7.01       6.85     1.02x
-exp2             5.41       5.66     0.96x
-expm1            5.96      10.23     0.58x
-log              7.01       7.47     0.94x
-log2             6.92       8.11     0.85x
-pow             23.60      22.95     1.03x
-sin             20.23      26.95     0.75x
-cos             28.84      27.99     1.03x
-tan             27.03      26.07     1.04x
-asin            12.24      12.67     0.97x
-atan2           26.78      26.97     0.99x
-cosh            13.46       9.82     1.37x
-sinh            14.84      28.17     0.53x
-tanh             6.64       9.68     0.69x
-asinh           28.45      20.70     1.37x
+sqrt             1.75       1.72     1.02x
+cbrt            17.20       7.89     2.18x
+fmod             7.21       7.85     0.92x
+exp              5.23       5.27     0.99x
+exp2             4.28       4.33     0.99x
+expm1            4.48       6.47     0.69x
+log              4.76       5.49     0.87x
+log2             5.14       5.93     0.87x
+pow             15.70      16.71     0.94x
+sin             14.45      17.87     0.81x
+cos             14.09      18.21     0.77x
+tan             17.87      18.13     0.99x
+asin             8.34       9.39     0.89x
+atan2           19.46      19.15     1.02x
+cosh             9.94       7.49     1.33x
+sinh            10.79      20.84     0.52x
+tanh             5.04       7.40     0.68x
+asinh           20.62      14.97     1.38x
 ```
 
-`cbrt` is more than twice as fast, `pow`/`exp`/`cos`/`tan`/`cosh`/`asinh` are
-at or above parity, and the rest sit within roughly 0.6-1.0x of glibc's
-hand-tuned kernels. Native builds use FMA (implied by AVX2) for the kernels
-that support it; the wasm32 build stays FMA-free and uses the portable
-fallbacks, so the same sources run unchanged there. The earlier double-double
-kernels (which cost 20-60x for `exp`/`pow`/`sinh`) are gone.
+`cbrt` is more than twice as fast, `cosh`/`asinh` are ~1.3–1.4x faster, and
+`sqrt`, `exp`, `exp2`, `tan` and `atan2` are near parity. The remaining
+kernels (`sin`, `cos`, `log`, `pow`, `expm1`, `tanh`, `sinh`) sit within
+roughly 0.5–0.9x of glibc's hand-tuned code. Native builds use FMA (implied by
+AVX2) for the kernels that support it; the wasm32 build stays FMA-free and uses
+the portable fallbacks, so the same sources run unchanged there. The earlier
+double-double kernels (which cost 20-60x for `exp`/`pow`/`sinh`) are gone.
 
 ### Profiling with perf
 
@@ -558,11 +585,12 @@ $ make wasm-example
 == asmlib wasm double-pendulum library ==
   module          : 13207 bytes, 0 imports
   samples         : 200000 steps (100.0 s)
-  wall time       : 264.8 ms  (0.8M steps/s)
+  wall time       : 209.4 ms  (1.0M steps/s)
   energy drift    : 6.319e-11
   tip x range     : [-1.9919, 2.0000]
   tip y range     : [-1.9996, 0.4828]
   max reach       : 2.0000 m (bound 2 m)
+  f32 final speed : 5.5722 rad/s
 OK: library ABI conserved energy and stayed physical
 ```
 
@@ -575,10 +603,10 @@ libm) for cross-checking.
 
 The string/memory routines and the arena's fixed and callback modes have no
 OS or libc dependency and link under `-nostdlib`. The only platform-specific
-code is `src/sys.asm` (Linux x86-64 `mmap`/`munmap`); on bare metal or another
-OS, pass your own `alloc`/`free` to `asm_arena_init_grow` and skip
-`asm_arena_init_mmap` and `asm_malloc`. The test/benchmark harnesses use libc,
-but the library itself does not.
+code is the syscall layer (`src/sys.asm` on x86-64, `src/aarch64/sys.S` on
+AArch64); on bare metal or another OS, pass your own `alloc`/`free` to
+`asm_arena_init_grow` and skip `asm_arena_init_mmap` and `asm_malloc`. The
+test/benchmark harnesses use libc, but the library itself does not.
 
 The math library (`src/math/`) is freestanding by construction: it calls no
 libc or `libm`, sets no `errno`, uses no floating-point environment and keeps
@@ -587,17 +615,16 @@ nothing.
 
 `src/libc/` is a portable C implementation of the same memory, string and
 allocator API (`memcpy`, `strlen`, `strlcpy`, `malloc`, `posix_memalign`, …)
-for targets where the NASM code cannot run. It is freestanding (no libc) and
-its allocator serves a first-fit free list from `__heap_base`,
+for targets where the assembly backends do not run. It is freestanding (no
+libc) and its allocator serves a first-fit free list from `__heap_base`,
 growing WebAssembly linear memory with `memory.grow` on demand (a fixed static
 pool is used in the native tests). The portable allocator is also thread-safe
 (C11 atomics; a no-op lock on wasm builds without threads). `make test-libc`
-differentially tests it
-against the host libc, including a guard-page suite; `make wasm` links it
-together with the math library into `build/asmlib.wasm`, a **complete
-freestanding libc-subset + libm** module with no imports. The arena allocator
-is not yet available on wasm (it is NASM today); the portable `malloc` is the
-wasm allocator.
+differentially tests it against the host libc, including a guard-page suite;
+`make wasm` links it together with the math library into `build/asmlib.wasm`, a
+**complete freestanding libc-subset + libm** module with no imports. The arena
+allocator is not available on wasm yet (only the assembly backends implement
+it); the portable `malloc` is the wasm allocator.
 
 ## AArch64 port
 

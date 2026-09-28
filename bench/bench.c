@@ -135,7 +135,7 @@ static void bench_str(size_t len) {
 }
 
 int main(void) {
-    printf("asmlib benchmark (ns/call, asm/libc and speedup; >1.00x is asm faster)\n");
+    printf("asmlib benchmark (ns/call, libc/asm and speedup; >1.00x means asmlib faster)\n");
     printf("CPU features: 0x%02x (AVX2/OS support: %d)\n",
            asm_cpu_features(), asm_cpu_has_avx2());
     printf("\n== memory: libc/asm ratio ==\n");
