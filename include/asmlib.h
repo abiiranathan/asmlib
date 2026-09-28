@@ -239,6 +239,32 @@ size_t asm_u64tohex(uint64_t value, char* buf, size_t cap, int uppercase);
 int asm_snprintf(char* dst, size_t size, const char* fmt, ...);
 
 /*==============================================================================
+ * Minimal, safe sscanf (format.asm / scan.asm)
+ *------------------------------------------------------------------------------
+ * `int asm_sscanf(const char* src, const char* fmt, ...)`
+ *
+ * A small, freestanding replacement for the common integer/string cases of
+ * sscanf. It never reads past the terminating NUL of src. Returns the number
+ * of successful assignments, or -1 on an input failure before the first
+ * conversion (like EOF) or on a malformed format.
+ *
+ * Supported conversions (an argument is consumed unless '*'):
+ *   %%  literal percent          %c  width bytes (default 1) into char*;
+ *                                    no whitespace skip, no NUL added
+ *   %s  whitespace-delimited into char*; a width is REQUIRED and at most
+ *       width bytes plus a NUL are written (buffer must hold width+1)
+ *   %d  %i  signed integer (%i auto-detects 0x/0X hex, leading-0 octal)
+ *   %u  %x %X %o  unsigned
+ *   %p  pointer as an optional 0x prefix followed by hex
+ * Modifiers: '*' suppresses the assignment; a decimal width bounds the input
+ * field; 'l'/'ll' select 64-bit for d/i/u/x/X/o. Overflowing values are
+ * clamped to the destination type's range. There is deliberately no floating
+ * point, scanset (%[...]), 'm' allocation, or %n.
+ *============================================================================*/
+
+int asm_sscanf(const char* src, const char* fmt, ...);
+
+/*==============================================================================
  * Arena allocator (arena.asm)
  *------------------------------------------------------------------------------
  * A chunked, resettable linear (bump) allocator. Every allocation is at

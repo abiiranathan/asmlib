@@ -75,5 +75,6 @@ size_t asm_i64toa(long long value, char *buf, size_t cap);
 size_t asm_u64toa_base(unsigned long long value, char *buf, size_t cap, unsigned base);
 size_t asm_u64tohex(unsigned long long value, char *buf, size_t cap, int uppercase);
 int    ASM_LIBC(snprintf)(char *dst, size_t size, const char *fmt, ...);
+int    ASM_LIBC(sscanf)(const char *src, const char *fmt, ...);
 
 #endif /* ASMLIB_PORTABLE_H */

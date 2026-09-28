@@ -80,43 +80,14 @@ L_gen_digits:
     cmp     r9d, 8
     je      .oct
     jmp     .generic
-    ; ---- decimal: two digits per reciprocal multiply (no div) ----
+    ; ---- decimal: fixed-chunk forward writer (no loop, no divide) ----
 .dec:
-    mov     r8, r10                     ; cursor, working back from the end
-    lea     r9, [rel L_dec_pairs]
-.loop_dec2:
-    cmp     rax, 100
-    jb      .dec_tail
-    mov     r11, rax                    ; r11 = v
-    mov     rdi, rax
-    shr     rdi, 2
-    mov     rdx, 0x28F5C28F5C28F5C3     ; compiler magic for /100
-    mov     rax, rdi
-    mul     rdx                         ; rdx = high((v>>2) * magic)
-    shr     rdx, 2                      ; rdx = v / 100
-    imul    rcx, rdx, 100
-    sub     r11, rcx                    ; remainder 0..99
-    movzx   ecx, word [r9+r11*2]        ; two ASCII digits
-    sub     r8, 2
-    mov     [r8], cx
-    mov     rax, rdx
-    jmp     .loop_dec2
-.dec_tail:
-    cmp     rax, 10
-    jb      .dec_one
-    movzx   ecx, word [r9+rax*2]
-    sub     r8, 2
-    mov     [r8], cx
-    jmp     .dec_done
-.dec_one:
-    add     al, '0'
-    dec     r8
-    mov     [r8], al
-.dec_done:
-    mov     rcx, r10
-    sub     rcx, r8                     ; digit count
-    mov     r15, rcx
-    mov     r11, r8
+    lea     r15, [r10-24]               ; scratch start (20 digits max)
+    mov     rdi, r15
+    call    L_dec_forward               ; writes digits; rdi = end
+    mov     r11, r15
+    mov     r15, rdi
+    sub     r15, r11                    ; digit count
     ret
     ; ---- hexadecimal: four bits per digit ----
 .hex:
@@ -196,6 +167,185 @@ L_gen_digits:
     ret
 
 ;==============================================================================
+; internal: L_dec_forward(rax = value, rdi = dst) -> rdi = end
+;------------------------------------------------------------------------------
+; Write the decimal digits of rax forward with no loop: the magnitude selects
+; a fixed-chunk path built from a 200-byte two-digit table and reciprocal
+; multiplies. Callers must guarantee at least 20 writable bytes at dst; the
+; write is exact (no padding) and leaves rdi one past the last digit.
+;
+; Clobbers rax, rcx, rdx, rsi, rdi, r8, r9, r10. All digit subroutines are leaf
+; except the recursive L_u32_to_str; saved values live on the stack, so r10
+; (the digit-pair table) and nothing else need survive across them.
+;==============================================================================
+L_dec_forward:
+    lea     r10, [rel L_dec_pairs]
+    mov     rsi, rax
+    mov     r8, 0xFFFFFFFF
+    cmp     rsi, r8
+    ja      .big
+    mov     eax, esi                    ; 0..2^32-1
+    call    L_u32_to_str
+    ret
+.big:
+    mov     r8, 10000000000000000
+    cmp     rsi, r8
+    jae     .huge
+    ; ---- 9..16 digits: hi64 = v/1e8, lo32 = v%1e8 ----
+    mov     rax, rsi
+    mov     r9, 0xabcc77118461cefd      ; magic for /1e8 (shift 26)
+    mul     r9
+    shr     rdx, 26                     ; rdx = v / 1e8
+    mov     rcx, 100000000
+    imul    rcx, rdx
+    sub     rsi, rcx                    ; lo32
+    mov     eax, edx                    ; hi64 (< 1e8)
+    push    rsi
+    call    L_u32_to_str
+    pop     rcx
+    call    L_put8
+    ret
+.huge:
+    ; ---- 17..20 digits: split off v/1e16, then 1e8 again ----
+    mov     rax, rsi
+    mov     r9, 0x39a5652fb1137857      ; magic for /1e16 (shift 51)
+    mul     r9
+    shr     rdx, 51                     ; rdx = hi_hi32 (< 1845)
+    mov     r8, rdx
+    mov     rcx, 10000000000000000
+    imul    rcx, r8
+    sub     rsi, rcx                    ; rem16
+    mov     eax, r8d
+    push    rsi
+    call    L_u32_to_str
+    pop     rsi
+    mov     rax, rsi
+    mov     r9, 0xabcc77118461cefd
+    mul     r9
+    shr     rdx, 26                     ; hi_lo32
+    mov     rcx, 100000000
+    imul    rcx, rdx
+    sub     rsi, rcx                    ; lo32
+    push    rsi
+    mov     ecx, edx
+    call    L_put8
+    pop     rcx
+    call    L_put8
+    ret
+
+;==============================================================================
+; internal: L_u32_to_str(eax = value) -> writes at rdi
+;------------------------------------------------------------------------------
+; 0..2^32-1, most significant chunk first, using the magnitude to pick a fixed
+; chunk size. Recurses once for the 5..8 digit case.
+;==============================================================================
+L_u32_to_str:
+    cmp     eax, 100
+    jb      .lt100
+    cmp     eax, 10000
+    jb      .lt1e4
+    cmp     eax, 100000000
+    jb      .lt1e8
+    ; 9..10 digits: hi = v/1e8, lo = v%1e8
+    mov     ecx, eax
+    mov     edx, 1441151881             ; /1e8 (32-bit, shift 57)
+    imul    rax, rdx
+    shr     rax, 57
+    imul    edx, eax, 100000000
+    sub     ecx, edx
+    push    rcx
+    mov     ecx, eax
+    call    L_write_tail2
+    pop     rcx
+    call    L_put8
+    ret
+.lt1e8:
+    ; 5..8 digits: hi = v/10000, lo = v%10000
+    mov     ecx, eax
+    mov     edx, 3518437209             ; /10000 (32-bit, shift 45)
+    imul    rax, rdx
+    shr     rax, 45
+    imul    edx, eax, 10000
+    sub     ecx, edx
+    push    rcx
+    mov     ecx, eax
+    call    L_u32_to_str
+    pop     rcx
+    call    L_put4
+    ret
+.lt1e4:
+    ; 3..4 digits: q = v/100, r = v%100
+    mov     ecx, eax
+    imul    rax, rax, 1374389535        ; /100 (32-bit, shift 37)
+    shr     rax, 37
+    imul    edx, eax, 100
+    sub     ecx, edx
+    push    rcx
+    mov     ecx, eax
+    call    L_write_tail2
+    pop     rcx
+    call    L_put2
+    ret
+.lt100:
+    mov     ecx, eax
+    jmp     L_write_tail2
+
+;==============================================================================
+; internal: L_write_tail2(ecx = 0..99) -> writes one or two digits
+;==============================================================================
+L_write_tail2:
+    cmp     ecx, 10
+    jae     .two
+    add     ecx, '0'
+    mov     [rdi], cl
+    inc     rdi
+    ret
+.two:
+    jmp     L_put2
+
+;==============================================================================
+; internal: L_put2(ecx = 0..99) -> two digits at rdi
+;==============================================================================
+L_put2:
+    movzx   edx, word [r10+rcx*2]
+    mov     [rdi], dx
+    add     rdi, 2
+    ret
+
+;==============================================================================
+; internal: L_put4(ecx = 0..9999) -> four digits at rdi
+;==============================================================================
+L_put4:
+    mov     eax, ecx
+    imul    rax, rax, 1374389535        ; q = v / 100
+    shr     rax, 37
+    imul    edx, eax, 100
+    sub     ecx, edx                    ; r = v % 100
+    movzx   edx, word [r10+rax*2]       ; high pair
+    mov     [rdi], dx
+    movzx   edx, word [r10+rcx*2]       ; low pair
+    mov     [rdi+2], dx
+    add     rdi, 4
+    ret
+
+;==============================================================================
+; internal: L_put8(ecx = 0..99999999) -> eight digits at rdi
+;==============================================================================
+L_put8:
+    mov     eax, ecx
+    mov     edx, 3518437209             ; hi = v / 10000
+    imul    rax, rdx
+    shr     rax, 45
+    imul    edx, eax, 10000
+    sub     ecx, edx                    ; lo = v % 10000
+    push    rcx
+    mov     ecx, eax
+    call    L_put4
+    pop     rcx
+    call    L_put4
+    ret
+
+;==============================================================================
 ; internal: L_nextarg -> rax
 ;------------------------------------------------------------------------------
 ; Return the next integer vararg slot. The first three arguments (rcx, r8, r9)
@@ -252,6 +402,43 @@ L_putn:
     mov     rsi, rax
 .fit:
     mov     rdx, rsi                    ; keep the stored count
+    cmp     rdx, 16
+    ja      .big
+    ; ---- small copy (1..16 bytes): overlapping wide moves, no rep startup ----
+    cmp     rdx, 8
+    jb      .lt8
+    mov     rax, [rdi]
+    mov     rcx, [rdi+rdx-8]
+    mov     [rbx], rax
+    mov     [rbx+rdx-8], rcx
+    jmp     .done
+.lt8:
+    cmp     rdx, 4
+    jb      .lt4
+    mov     eax, [rdi]
+    mov     ecx, [rdi+rdx-4]
+    mov     [rbx], eax
+    mov     [rbx+rdx-4], ecx
+    jmp     .done
+.lt4:
+    test    rdx, rdx
+    jz      .done
+    movzx   eax, byte [rdi]
+    mov     [rbx], al
+    cmp     rdx, 2
+    jb      .done
+    movzx   eax, byte [rdi+rdx-1]
+    mov     [rbx+rdx-1], al
+    cmp     rdx, 3
+    jb      .done
+    movzx   eax, byte [rdi+1]
+    mov     [rbx+1], al
+.done:
+    add     rbx, rdx
+    sub     r12, rdx
+.ret:
+    ret
+.big:
     mov     rax, rdi
     mov     rdi, rbx
     mov     rsi, rax
@@ -259,7 +446,6 @@ L_putn:
     rep     movsb
     mov     rbx, rdi
     sub     r12, rdx
-.ret:
     ret
 
 ;==============================================================================
@@ -278,12 +464,41 @@ L_putrep:
     mov     rsi, r10
 .fit:
     mov     rdx, rsi
+    cmp     rdx, 16
+    ja      .big
+    ; ---- small fill (1..16 bytes): replicate the byte into a qword ----
+    movzx   eax, al
+    mov     rcx, 0x0101010101010101
+    imul    rax, rcx
+    cmp     rdx, 8
+    jb      .lt8
+    mov     [rbx], rax
+    mov     [rbx+rdx-8], rax
+    jmp     .done
+.lt8:
+    cmp     rdx, 4
+    jb      .lt4
+    mov     [rbx], eax
+    mov     [rbx+rdx-4], eax
+    jmp     .done
+.lt4:
+    test    rdx, rdx
+    jz      .done
+    mov     [rbx], al
+    cmp     rdx, 2
+    jb      .done
+    mov     [rbx+rdx-2], ax
+.done:
+    add     rbx, rdx
+    sub     r12, rdx
+.ret:
+    ret
+.big:
     mov     rdi, rbx
     mov     rcx, rdx
     rep     stosb
     mov     rbx, rdi
     sub     r12, rdx
-.ret:
     ret
 
 ;==============================================================================
@@ -721,9 +936,26 @@ L_utoa_base_case:
 
 ;==============================================================================
 ; size_t asm_u64toa(uint64_t value, char *buf, size_t cap)
+;------------------------------------------------------------------------------
+; When cap is large enough for any 64-bit decimal the digits are written
+; straight into buf (no scratch and no copy); otherwise the shared bounded
+; path formats into a small scratch and copies the leading bytes.
 ;==============================================================================
 global asm_u64toa:function
 asm_u64toa:
+    cmp     rdx, 21                     ; 20 digits + NUL fits?
+    jb      .small
+    push    rbx
+    mov     rbx, rsi                    ; remember buf
+    mov     rax, rdi
+    mov     rdi, rsi
+    call    L_dec_forward               ; rdi = end
+    mov     byte [rdi], 0
+    mov     rax, rdi
+    sub     rax, rbx
+    pop     rbx
+    ret
+.small:
     mov     r10d, 10
     xor     r11d, r11d
     jmp     L_utoa_base_case
@@ -749,18 +981,32 @@ asm_u64tohex:
 ;==============================================================================
 ; size_t asm_i64toa(int64_t value, char *buf, size_t cap)
 ;------------------------------------------------------------------------------
-; Signed decimal: writes the leading '-' for negative values and returns the
-; full length including the sign.
-;
-; Parameters (System V AMD64 ABI):
-;   rdi = value (int64_t)
-;   rsi = buf (char *)
-;   rdx = cap (size_t)
-; Returns:
-;   rax = full length excluding the NUL
+; Direct write when cap fits a sign and 20 digits; otherwise the shared bounded
+; path. The return value is the full length including the sign.
 ;==============================================================================
 global asm_i64toa:function
 asm_i64toa:
+    cmp     rdx, 22                     ; '-' + 20 digits + NUL fits?
+    jb      L_i64toa_small
+    push    rbx
+    mov     rbx, rsi
+    mov     rax, rdi
+    test    rax, rax
+    jns     .pos
+    neg     rax
+    mov     byte [rsi], '-'
+    inc     rsi
+.pos:
+    mov     rdi, rsi
+    call    L_dec_forward
+    mov     byte [rdi], 0
+    mov     rax, rdi
+    sub     rax, rbx
+    pop     rbx
+    ret
+
+; ---- bounded fallback: format into scratch, then copy what fits ----
+L_i64toa_small:
     push    r12                         ; preserve callee-saved
     push    r13
     push    r14
