@@ -70,6 +70,14 @@ extern asm_sys_munmap
 %define TC_BYTES_OFF    (TC_CLASSES * 8) ; size_t TC_BYTES_OFF - byte counter in the TLS block
 %define TCACHE_BUDGET   (1024 * 1024)   ; size_t TCACHE_BUDGET - cached payload bytes per thread
 
+; ASMLIB_ALLOC_DEBUG: a small block carries this magic in the otherwise-unused
+; second header word while it is on a free list, so freeing it twice traps
+; (ud2) instead of corrupting the list. Large and indirect blocks cannot be
+; checked this way (their second word is live metadata).
+%ifdef ASMLIB_ALLOC_DEBUG
+%define FREED_MAGIC     0xF4EEF4EEF4EEF4EE
+%endif
+
 section .bss
 align 64
 malloc_freelist: resq NUM_CLASSES       ; one singly-linked list per size class
@@ -305,6 +313,13 @@ asm_free:
     je      .slow                       ; yes -> release under the lock
     cmp     rax, INDIRECT               ; aligned/indirect marker?
     je      .slow                       ; yes -> release under the lock
+%ifdef ASMLIB_ALLOC_DEBUG
+    ; ---- debug: catch a double free of a small block ----
+    mov     r9, FREED_MAGIC
+    cmp     [rdi-HDR+8], r9
+    je      .double_free
+    mov     [rdi-HDR+8], r9
+%endif
     ; ---- small: park it on this thread's cache if there is budget ----
     mov     rcx, rax                    ; class bytes = class * 16
     shl     rcx, 4                      ; class bytes
@@ -320,6 +335,10 @@ asm_free:
     mov     [r8+rax*8], rdi             ; tc_head[class] = block
 .ret:
     ret                                 ; return (block cached or NULL)
+%ifdef ASMLIB_ALLOC_DEBUG
+.double_free:
+    ud2                                 ; trap: double free of a small block
+%endif
     ; ---- large/indirect: take the lock ----
 .slow:
     push    rbx                         ; preserve callee-saved + keep rsp aligned
@@ -328,6 +347,64 @@ asm_free:
     call    L_unlock                    ; leave the critical section
     pop     rbx                         ; restore callee-saved register
     ret                                 ; return
+
+;==============================================================================
+; size_t asm_alloc_flush_tcache(void)
+;------------------------------------------------------------------------------
+; Moves every block parked in the calling thread's tcache back onto the shared
+; class lists under malloc_lock and returns how many blocks were returned. Call
+; it from a thread-exit hook so a short-lived thread does not strand up to
+; TCACHE_BUDGET bytes in its cache (the portable backend has no cache and
+; returns 0).
+;
+; Returns:
+;   rax = number of blocks returned to the shared heap
+;==============================================================================
+global asm_alloc_flush_tcache:function
+asm_alloc_flush_tcache:
+    push    rbx                         ; keep rsp 16-byte aligned for calls
+    push    r14                         ; returned block count
+    push    r15                         ; class index
+    mov     r8, [rel asm_tcache wrt ..gottpoff]
+    add     r8, fs:0                    ; r8 = this thread's tcache
+    mov     rdx, [r8+TC_BYTES_OFF]      ; anything cached?
+    test    rdx, rdx
+    jz      .none
+    xor     r14d, r14d                  ; returned blocks
+    call    L_lock                      ; enter the critical section
+    lea     r9, [rel malloc_freelist]
+    xor     r15d, r15d                  ; class index
+.class:
+    mov     rax, [r8+r15*8]             ; tcache head for this class
+    test    rax, rax
+    jz      .next
+    mov     qword [r8+r15*8], 0         ; detach the whole chain
+.block:
+    mov     rcx, [rax]                  ; next
+    mov     rdx, [r9+r15*8]             ; global head
+    mov     [rax], rdx                  ; block->next = global head
+    mov     [r9+r15*8], rax             ; global head = block
+    inc     r14
+    mov     rax, rcx
+    test    rax, rax
+    jnz     .block
+.next:
+    inc     r15
+    cmp     r15, TC_CLASSES
+    jb      .class
+    mov     qword [r8+TC_BYTES_OFF], 0  ; cache is empty again
+    call    L_unlock
+    mov     rax, r14
+    pop     r15
+    pop     r14
+    pop     rbx
+    ret
+.none:
+    xor     eax, eax                    ; nothing cached
+    pop     r15
+    pop     r14
+    pop     rbx
+    ret
 
 ;==============================================================================
 ; void *asm_calloc(size_t count, size_t size)

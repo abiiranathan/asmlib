@@ -122,4 +122,29 @@ global asm_sys_free:function            ; export the arena free callback as a fu
 asm_sys_free:
     jmp     asm_sys_munmap              ; tail-call munmap; rdi = ptr, rsi = size already
 
+;==============================================================================
+; int asm_arena_init_mmap(asm_arena *a, size_t chunk_size)
+;------------------------------------------------------------------------------
+; Growable arena whose chunks come straight from the kernel via anonymous mmap.
+; No libc, no caller-supplied allocator. Linux x86-64 only (this module is the
+; sole OS boundary); the arena itself lives in arena.asm and pulls no syscalls.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = a (asm_arena *)  - arena to initialise
+;   rsi = chunk_size (size_t)  - default chunk size, clamped up to 4096
+; Returns:
+;   rax = 0 on success, -1 if a is NULL
+; Uses / clobbers:
+;   Reads rdi, rsi; writes rax, rcx, rdx, r8, r9; tail-calls asm_arena_init_grow.
+;==============================================================================
+extern asm_arena_init_grow
+global asm_arena_init_mmap:function
+asm_arena_init_mmap:
+    ; ---- wire up the anonymous-mmap backend ----
+    mov     r8, rsi                     ; chunk_size
+    xor     ecx, ecx                    ; ctx = NULL
+    lea     rsi, [rel asm_sys_alloc]    ; alloc callback
+    lea     rdx, [rel asm_sys_free]     ; free callback
+    jmp     asm_arena_init_grow         ; tail-call the growable initialiser
+
 GNU_STACK_NOTE                          ; emit the non-executable .note.GNU-stack section

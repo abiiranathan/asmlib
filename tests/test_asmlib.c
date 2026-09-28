@@ -485,12 +485,13 @@ static void test_guards(void) {
  *----------------------------------------------------------------------------*/
 static void test_cpu(void) {
     unsigned f = asm_cpu_features();
-    /* On x86-64 this library requires AVX2/BMI1, so they must be present. On
-     * AArch64 those bits are x86-only and asm_cpu_has_avx2() is 0 by design. */
+    /* Haswell-and-later x86-64 exposes AVX2 + BMI1; older CPUs (and AArch64)
+     * do not, and the library silently falls back to its scalar routines. The
+     * only invariant is that the predicate agrees with the feature mask, and
+     * that AVX2/BMI1 travel together on x86-64 when both are advertised. */
 #if defined(__x86_64__) || defined(__i386__)
-    CHECK((f & ASMLIB_CPU_AVX2) != 0, "cpu avx2");
-    CHECK((f & ASMLIB_CPU_BMI1) != 0, "cpu bmi1");
-    CHECK(asm_cpu_has_avx2() == 1, "cpu has_avx2");
+    CHECK(asm_cpu_has_avx2() == ((f & ASMLIB_CPU_AVX2) ? 1 : 0), "cpu has_avx2");
+    if (f & ASMLIB_CPU_AVX2) CHECK((f & ASMLIB_CPU_BMI1) != 0, "cpu bmi1 with avx2");
 #else
     CHECK((f & ASMLIB_CPU_AVX2) == 0, "cpu no-avx2");
     CHECK(asm_cpu_has_avx2() == 0, "cpu no-has_avx2");

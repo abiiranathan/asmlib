@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+# asmlib package configuration.
+#
+# Imported targets:
+#   asmlib::asmlib           the shared library (if ASMLIB_BUILD_SHARED)
+#   asmlib::asmlib_static    the static library (if ASMLIB_BUILD_STATIC)
+#   asmlib::asmlib_scalar    the fully scalar fallback archive
+#
+#   find_package(asmlib REQUIRED)
+#   target_link_libraries(app PRIVATE asmlib::asmlib)
+
+include("${CMAKE_CURRENT_LIST_DIR}/asmlibTargets.cmake")
+
+check_required_components(asmlib)

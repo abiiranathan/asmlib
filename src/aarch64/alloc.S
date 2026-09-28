@@ -70,6 +70,13 @@
 #define TC_BYTES_OFF    (TC_CLASSES * 8) /* byte counter in the TLS block          */
 #define TCACHE_BUDGET   (1024 * 1024)   /* cached payload bytes per thread        */
 
+/* ASMLIB_ALLOC_DEBUG: a small block carries this magic in the otherwise-unused
+ * second header word while it is on a free list, so freeing it twice traps
+ * instead of corrupting the list. Large/indirect blocks cannot be checked. */
+#ifdef ASMLIB_ALLOC_DEBUG
+#define FREED_MAGIC     0xF4EEF4EEF4EEF4EE
+#endif
+
     .bss
     .align 6
     .type malloc_freelist, %object
@@ -348,6 +355,14 @@ asm_free:
     b.eq    .Lasmfree_slow              /* yes -> release under the lock         */
     cmn     x1, #2                      /* aligned/indirect marker?              */
     b.eq    .Lasmfree_slow              /* yes -> release under the lock         */
+#ifdef ASMLIB_ALLOC_DEBUG
+    /* ---- debug: catch a double free of a small block ---- */
+    ldr     x9, =FREED_MAGIC
+    ldr     x10, [x0, #-HDR + 8]
+    cmp     x10, x9
+    b.eq    .Lasmfree_double
+    str     x9, [x0, #-HDR + 8]
+#endif
     /* ---- small: park it on this thread's cache if there is budget ---- */
     lsl     x2, x1, #4                  /* class bytes = class * 16              */
     mrs     x9, tpidr_el0               /* x9 = thread pointer                   */
@@ -364,6 +379,10 @@ asm_free:
     str     x0, [x9, x1, lsl #3]        /* tc_head[class] = block                */
 .Lasmfree_ret:
     ret                                 /* return (block cached or NULL)         */
+#ifdef ASMLIB_ALLOC_DEBUG
+.Lasmfree_double:
+    brk     #0                          /* trap: double free of a small block    */
+#endif
     /* ---- large/indirect: take the lock ---- */
 .Lasmfree_slow:
     str     x30, [sp, #-16]!            /* preserve lr, keep rsp aligned         */
@@ -373,6 +392,61 @@ asm_free:
     ldr     x30, [sp], #16
     ret
     .size asm_free, .-asm_free
+
+/*==============================================================================
+ * size_t asm_alloc_flush_tcache(void)
+ *------------------------------------------------------------------------------
+ * Move every block parked in the calling thread's tcache back onto the shared
+ * class lists and return how many were returned. Call it from a thread-exit
+ * hook so a short-lived thread does not strand its per-thread cache budget.
+ *============================================================================*/
+    .globl asm_alloc_flush_tcache
+    .type  asm_alloc_flush_tcache, %function
+    .p2align 2
+asm_alloc_flush_tcache:
+    stp     x19, x20, [sp, #-16]!       /* count, tcache base                    */
+    stp     x21, x22, [sp, #-16]!       /* free-list base, class index           */
+    str     x30, [sp, #-16]!
+    mrs     x20, tpidr_el0
+    add     x20, x20, :tprel_hi12:asm_tcache
+    add     x20, x20, :tprel_lo12_nc:asm_tcache   /* x20 = this thread's tcache */
+    ldr     x9, [x20, #TC_BYTES_OFF]
+    cbz     x9, .Lflush_none
+    mov     x19, #0                     /* returned block count                  */
+    bl      L_lock                      /* enter the critical section            */
+    adrp    x21, malloc_freelist
+    add     x21, x21, :lo12:malloc_freelist
+    mov     x22, #0                     /* class index                           */
+.Lflush_class:
+    ldr     x0, [x20, x22, lsl #3]      /* tcache head for this class            */
+    cbz     x0, .Lflush_next
+    str     xzr, [x20, x22, lsl #3]     /* detach the chain                      */
+.Lflush_block:
+    ldr     x1, [x0]                    /* next                                  */
+    ldr     x2, [x21, x22, lsl #3]      /* global head                           */
+    str     x2, [x0]                    /* block->next = global head             */
+    str     x0, [x21, x22, lsl #3]      /* global head = block                   */
+    add     x19, x19, #1
+    mov     x0, x1
+    cbnz    x0, .Lflush_block
+.Lflush_next:
+    add     x22, x22, #1
+    cmp     x22, #TC_CLASSES
+    b.lo    .Lflush_class
+    str     xzr, [x20, #TC_BYTES_OFF]   /* cache is empty again                  */
+    bl      L_unlock                    /* leave the critical section            */
+    mov     x0, x19
+    ldr     x30, [sp], #16
+    ldp     x21, x22, [sp], #16
+    ldp     x19, x20, [sp], #16
+    ret
+.Lflush_none:
+    mov     x0, #0                      /* nothing cached                        */
+    ldr     x30, [sp], #16
+    ldp     x21, x22, [sp], #16
+    ldp     x19, x20, [sp], #16
+    ret
+    .size asm_alloc_flush_tcache, .-asm_alloc_flush_tcache
 
 /*==============================================================================
  * void *asm_calloc(size_t count, size_t size)

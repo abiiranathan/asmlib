@@ -111,4 +111,30 @@ asm_sys_free:
     b       asm_sys_munmap              /* arg0/arg1 already in place           */
     .size asm_sys_free, .-asm_sys_free
 
+/*==============================================================================
+ * int asm_arena_init_mmap(asm_arena *a, size_t chunk_size)
+ *------------------------------------------------------------------------------
+ * Growable arena whose chunks come straight from the kernel via anonymous mmap.
+ * Linux AArch64 only (this module is the sole OS boundary); arena.S itself has
+ * no syscalls, so an arena over caller memory links without any OS code.
+ *
+ * Parameters (AAPCS64):
+ *   x0 = a          (asm_arena *) - arena to initialise
+ *   x1 = chunk_size (size_t)      - default chunk size, clamped up to 4096
+ * Returns:
+ *   w0 = 0 on success, -1 if a is NULL
+ *============================================================================*/
+    .globl asm_arena_init_mmap
+    .type  asm_arena_init_mmap, %function
+    .p2align 2
+asm_arena_init_mmap:
+    mov     x4, x1                      /* arg5 = chunk_size                     */
+    mov     x3, xzr                     /* arg4 = ctx = NULL                     */
+    adrp    x1, asm_sys_alloc
+    add     x1, x1, :lo12:asm_sys_alloc /* arg2 = asm_sys_alloc callback         */
+    adrp    x2, asm_sys_free
+    add     x2, x2, :lo12:asm_sys_free  /* arg3 = asm_sys_free callback          */
+    b       asm_arena_init_grow         /* tail-call the growable initialiser    */
+    .size asm_arena_init_mmap, .-asm_arena_init_mmap
+
 GNU_STACK_NOTE

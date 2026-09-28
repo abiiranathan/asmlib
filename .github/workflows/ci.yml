@@ -18,17 +18,29 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm
+          sudo apt-get install -y nasm qemu-user-static
       - name: Build asm library
         run: make CC=${{ matrix.cc }}
       - name: Differential tests
         run: make CC=${{ matrix.cc }} test
+      - name: Runtime scalar fallback (no AVX2 under qemu)
+        run: make CC=${{ matrix.cc }} test-fallback
       - name: Math differential tests
         run: make CC=${{ matrix.cc }} test-math
       - name: Portable libc tests
         run: make CC=${{ matrix.cc }} test-libc
+      - name: Scalar fallback library
+        run: make CC=${{ matrix.cc }} test-scalar
       - name: AddressSanitizer + UBSan
         run: make CC=${{ matrix.cc }} test-asan
+      - name: install + pkg-config
+        run: |
+          make install DESTDIR="$PWD/stage" PREFIX=/usr
+          export PKG_CONFIG_PATH="$PWD/stage/usr/lib/pkgconfig"
+          pkg-config --exists asmlib
+          printf '#include "asmlib.h"\nint main(void){return asm_strlen("x")!=1;}\n' > /tmp/t.c
+          cc /tmp/t.c $(pkg-config --cflags --libs asmlib) -Wl,-rpath,"$PWD/stage/usr/lib" -o /tmp/t
+          /tmp/t
 
   valgrind:
     name: valgrind memcheck
@@ -53,6 +65,20 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
       - name: Cross-build and run the differential suites under qemu
         run: make test-aarch64
+
+  fuzz:
+    name: libFuzzer (short budget)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm clang lld
+      - name: Build
+        run: make
+      - name: Fuzz converters, formatters, scanner and linalg
+        run: make fuzz FUZZ_TIME=20
 
   wasm:
     name: wasm32 build
@@ -87,3 +113,60 @@ jobs:
           JS
       - name: Build and check the double-pendulum library module
         run: make wasm-example
+      - name: Build and check the image-editing library module
+        run: make wasm-image-example
+
+  docs:
+    name: API docs (Doxygen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen
+      - name: Build the HTML API reference
+        run: |
+          make docs
+          test -f build/docs/html/index.html
+
+  cmake:
+    name: CMake build + package (x86-64 and AArch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gcc-aarch64-linux-gnu qemu-user-static
+      - name: "x86-64: build, install and consume the package"
+        run: |
+          cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cmake -j
+          cmake --install build-cmake --prefix "$PWD/stage"
+          mkdir -p consumer && cd consumer
+          printf '#include "asmlib.h"\nint main(void){return asm_strlen("x")!=1;}\n' > app.c
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer C)
+          find_package(asmlib 1.0 REQUIRED)
+          add_executable(app_shared app.c)
+          target_link_libraries(app_shared PRIVATE asmlib::asmlib)
+          add_executable(app_static app.c)
+          target_link_libraries(app_static PRIVATE asmlib::asmlib_static)
+          EOF
+          cmake -S . -B b -DCMAKE_PREFIX_PATH="$PWD/../stage"
+          cmake --build b
+          LD_LIBRARY_PATH="$PWD/../stage/lib" ./b/app_shared
+          ./b/app_static
+          export PKG_CONFIG_PATH="$PWD/../stage/lib/pkgconfig"
+          pkg-config --exists asmlib
+          cc app.c $(pkg-config --cflags --libs asmlib) -Wl,-rpath,"$PWD/../stage/lib" -o app_pc
+          ./app_pc
+      - name: "AArch64: cross-configure, build, and run the differential suite"
+        run: |
+          cmake -S . -B build-aarch64 -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake
+          cmake --build build-aarch64 -j
+          aarch64-linux-gnu-gcc -O2 -Iinclude -static \
+            -o test_a64 tests/test_asmlib.c build-aarch64/libasmlib.a
+          qemu-aarch64-static ./test_a64

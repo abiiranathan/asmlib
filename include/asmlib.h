@@ -2,29 +2,34 @@
  * asmlib.h - public C interface to the asmlib memory/string library
  *------------------------------------------------------------------------------
  * SPDX-License-Identifier: MIT
+ *============================================================================*/
+
+/**
+ * @file asmlib.h
+ * @brief Umbrella header for the whole asmlib library.
  *
  * A drop-in, high-performance replacement for the hottest libc memory and
  * string routines, implemented in hand-written x86-64 (AVX2/BMI2) and
- * AArch64 (NEON) assembly, all behind the asm_* names below.
+ * AArch64 (NEON) assembly, all behind the `asm_*` names declared here. The
+ * freestanding math library and the vector/matrix/quaternion API are included
+ * at the bottom, so `#include "asmlib.h"` is the whole public surface.
  *
- * Requirements
- * ------------
+ * @section asm_requirements Requirements
  *   - x86-64 (System V AMD64 ABI: Linux, *BSD, macOS) with AVX2 and BMI1
  *     (tzcnt) at run time. Query asm_cpu_has_avx2() before calling any of the
- *     vectors if you must support older CPUs.
+ *     vectors if you must support older CPUs. On hosted Linux the hot routines
+ *     are resolved to AVX2 or the scalar fallback automatically (ELF IFUNC).
  *   - AArch64 (AAPCS64: Linux); NEON is baseline, so no feature check is
  *     needed (asm_cpu_has_avx2() returns 0 there).
  *
- * Linking
- * -------
- *   -Iinclude  and link against -lasmlib (static or shared).
+ * @section asm_linking Linking
+ *   `-Iinclude` and link against `-lasmlib` (static or shared).
  *
- * Optional libc aliasing
- * ----------------------
- *   Define ASMLIB_ENABLE_LIBC_ALIASES before including this header to have the
- *   standard names (memcpy, strlen, ...) map to the asm_* implementations by
- *   way of macros. This lets an existing program use the library unchanged.
- *============================================================================*/
+ * @section asm_aliases Optional libc aliasing
+ *   Define ::ASMLIB_ENABLE_LIBC_ALIASES before including this header to have
+ *   the standard names (memcpy, strlen, ...) map to the `asm_*` implementations
+ *   by way of macros. This lets an existing program use the library unchanged.
+ */
 
 #ifndef ASMLIB_H
 #define ASMLIB_H
@@ -32,373 +37,507 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "asmlib_version.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/*------------------------------------------------------------------------------
- * Runtime CPU feature bits returned by asm_cpu_features().
- *----------------------------------------------------------------------------*/
-#define ASMLIB_CPU_SSE2   (1u << 0) /* Streaming SIMD Extensions 2          */
-#define ASMLIB_CPU_AVX    (1u << 1) /* AVX (and OS vector state enabled)    */
-#define ASMLIB_CPU_AVX2   (1u << 2) /* AVX2 integer/byte vectors            */
-#define ASMLIB_CPU_BMI1   (1u << 3) /* tzcnt / lzcnt / andn                 */
-#define ASMLIB_CPU_BMI2   (1u << 4) /* mulx / rorx / pdep / pext            */
-#define ASMLIB_CPU_ERMS   (1u << 5) /* Enhanced REP MOVSB/STOSB             */
-#define ASMLIB_CPU_POPCNT (1u << 6) /* POPCNT                               */
-#define ASMLIB_CPU_FMA    (1u << 7) /* Fused multiply-add                   */
+/** @defgroup asm_runtime Runtime: version and CPU features
+ *  @{ */
 
-/* Return the feature bitmap for the current CPU/OS. */
+/**
+ * @brief Runtime version string, "MAJOR.MINOR.PATCH".
+ * @return A statically allocated NUL-terminated string (never NULL).
+ */
+const char* asm_version(void);
+
+/**
+ * @brief Platform / OS boundary.
+ *
+ * The OS-backed surface - asm_sys_mmap/munmap/alloc/free, the asm_malloc heap
+ * and asm_arena_init_mmap - is built on raw Linux syscalls and is Linux-only.
+ * Everything else (memory, string, comparison, search, ctype, arena over
+ * caller memory, math, format, scan, vector/matrix) is freestanding: no OS, no
+ * libc, linkable with `-nostdlib`. ::ASMLIB_OS_HEAP is 1 when compiling for
+ * Linux, 0 elsewhere; the freestanding routines work either way.
+ */
+#if defined(__linux__) && !defined(ASMLIB_OS_HEAP)
+#define ASMLIB_OS_HEAP 1
+#endif
+#if !defined(ASMLIB_OS_HEAP)
+#define ASMLIB_OS_HEAP 0
+#endif
+
+/** @name CPU feature bits returned by asm_cpu_features()
+ *  @{ */
+#define ASMLIB_CPU_SSE2   (1u << 0) /**< Streaming SIMD Extensions 2        */
+#define ASMLIB_CPU_AVX    (1u << 1) /**< AVX (and OS vector state enabled)  */
+#define ASMLIB_CPU_AVX2   (1u << 2) /**< AVX2 integer/byte vectors          */
+#define ASMLIB_CPU_BMI1   (1u << 3) /**< tzcnt / lzcnt / andn               */
+#define ASMLIB_CPU_BMI2   (1u << 4) /**< mulx / rorx / pdep / pext          */
+#define ASMLIB_CPU_ERMS   (1u << 5) /**< Enhanced REP MOVSB/STOSB           */
+#define ASMLIB_CPU_POPCNT (1u << 6) /**< POPCNT                             */
+#define ASMLIB_CPU_FMA    (1u << 7) /**< Fused multiply-add                 */
+/** @} */
+
+/**
+ * @brief Return the feature bitmap for the current CPU/OS.
+ * @return A mask of the `ASMLIB_CPU_*` bits.
+ */
 unsigned asm_cpu_features(void);
 
-/* Convenience predicate: non-zero when AVX2 is usable. */
+/**
+ * @brief Convenience predicate for AVX2 usability.
+ * @return Non-zero when AVX2 (and its OS vector state) is available.
+ */
 int asm_cpu_has_avx2(void);
 
-/*==============================================================================
- * Memory primitives (memory.asm)
- *============================================================================*/
+/**
+ * @brief Abort if the CPU lacks AVX2/BMI1 (x86-64 only).
+ *
+ * If the CPU lacks AVX2/BMI1, writes a short message to stderr and calls
+ * `exit(2)` instead of faulting inside a vector routine. Call once at startup.
+ * Uses raw Linux syscalls; on AArch64 it is unnecessary (NEON is baseline).
+ */
+void asm_cpu_require_avx2(void);
 
-/* Copy n bytes from src to dst (must not overlap). Returns dst. */
+/** @} */
+
+/** @defgroup asm_memory Memory primitives (memory.asm)
+ *  @{ */
+
+/** @brief Copy `n` bytes from `src` to `dst` (regions must not overlap).
+ *  @return `dst`. */
 void* asm_memcpy(void* dst, const void* src, size_t n);
 
-/* Copy n bytes from src to dst (must not overlap). Returns dst + n. */
+/** @brief Copy `n` bytes from `src` to `dst` (regions must not overlap).
+ *  @return `dst + n`. */
 void* asm_mempcpy(void* dst, const void* src, size_t n);
 
-/* Copy up to n bytes from src to dst, stopping after the byte equal to
- * (unsigned char)c. Returns a pointer just past that byte in dst, or NULL. */
+/**
+ * @brief Copy up to `n` bytes from `src` to `dst`, stopping after the byte
+ *        equal to `(unsigned char)c`.
+ * @return A pointer just past that byte in `dst`, or `NULL` if `c` was not
+ *         found within `n` bytes.
+ */
 void* asm_memccpy(void* dst, const void* src, int c, size_t n);
 
-/* Copy n bytes from src to dst; the regions may overlap. Returns dst. */
+/** @brief Copy `n` bytes from `src` to `dst`; the regions may overlap.
+ *  @return `dst`. */
 void* asm_memmove(void* dst, const void* src, size_t n);
 
-/* Fill n bytes at dst with the low byte of c. Returns dst. */
+/** @brief Fill `n` bytes at `dst` with the low byte of `c`.
+ *  @return `dst`. */
 void* asm_memset(void* dst, int c, size_t n);
 
-/* Zero n bytes at dst. Returns dst. */
+/** @brief Zero `n` bytes at `dst`.
+ *  @return `dst`. */
 void* asm_bzero(void* dst, size_t n);
 
-/* Zero n bytes at dst; the out-of-line call cannot be elided by the compiler. */
+/** @brief Zero `n` bytes at `dst`; the out-of-line call cannot be elided by the
+ *         compiler. */
 void asm_explicit_bzero(void* dst, size_t n);
 
-/* Compare n bytes. Returns <0, 0 or >0 using unsigned byte values. */
+/** @brief Compare `n` bytes.
+ *  @return `<0`, `0` or `>0` using unsigned byte values. */
 int asm_memcmp(const void* a, const void* b, size_t n);
 
-/* First byte equal to c in the first n bytes, or NULL. */
+/** @brief First byte equal to `c` in the first `n` bytes.
+ *  @return Pointer to it, or `NULL`. */
 void* asm_memchr(const void* s, int c, size_t n);
 
-/* Last byte equal to c in the first n bytes, or NULL. */
+/** @brief Last byte equal to `c` in the first `n` bytes.
+ *  @return Pointer to it, or `NULL`. */
 void* asm_memrchr(const void* s, int c, size_t n);
 
-/*==============================================================================
- * String primitives (string.asm)
- *============================================================================*/
+/** @} */
 
-/* Length of the NUL-terminated string s. */
+/** @defgroup asm_string String primitives (string.asm)
+ *  @{ */
+
+/** @brief Length of the NUL-terminated string `s`.
+ *  @return The number of bytes before the terminating NUL. */
 size_t asm_strlen(const char* s);
 
-/* Length of s, but never reads past s + maxlen. */
+/** @brief Length of `s`, but never reads past `s + maxlen`.
+ *  @return `min(strlen(s), maxlen)`. */
 size_t asm_strnlen(const char* s, size_t maxlen);
 
-/* Copy at most n bytes of src, NUL-padding the remainder. Returns dst.
- * The number of bytes written is bounded by n; unlike asm_strcpy (removed),
- * this can never copy an unbounded amount into dst. */
+/** @brief Copy at most `n` bytes of `src`, NUL-padding the remainder.
+ *
+ * The number of bytes written is bounded by `n`; unlike a bare `strcpy`, this
+ * can never copy an unbounded amount into `dst`.
+ * @return `dst`. */
 char* asm_strncpy(char* dst, const char* src, size_t n);
 
-/* Like asm_strncpy, but returns the terminating NUL when one was written,
- * otherwise dst + n (POSIX stpncpy). */
+/** @brief Like asm_strncpy(), but returns the terminating NUL when one was
+ *         written, otherwise `dst + n` (POSIX stpncpy). */
 char* asm_stpncpy(char* dst, const char* src, size_t n);
 
-/* Append at most n bytes of src, then NUL-terminate. Returns dst.
- * The number of bytes appended is bounded by n; unlike asm_strcat (removed),
- * this can never append an unbounded amount into dst. */
+/** @brief Append at most `n` bytes of `src`, then NUL-terminate.
+ *
+ * The number of bytes appended is bounded by `n`; unlike a bare `strcat`, this
+ * can never append an unbounded amount into `dst`.
+ * @return `dst`. */
 char* asm_strncat(char* dst, const char* src, size_t n);
 
-/* BSD bounded copy: at most size-1 bytes and always NUL-terminated when
- * size > 0; never writes past dst[size-1]. Returns strlen(src). */
+/**
+ * @brief BSD bounded copy.
+ *
+ * Copies at most `size - 1` bytes and always NUL-terminates when `size > 0`;
+ * never writes past `dst[size - 1]`.
+ * @return `strlen(src)`.
+ */
 size_t asm_strlcpy(char* dst, const char* src, size_t size);
 
-/* BSD bounded append: appends at most size-strlen(dst)-1 bytes, terminates,
- * and never writes past dst[size-1]. Returns min(size, strlen(dst)) +
- * strlen(src); when dst has no NUL within size it writes nothing. */
+/**
+ * @brief BSD bounded append.
+ *
+ * Appends at most `size - strlen(dst) - 1` bytes, NUL-terminates, and never
+ * writes past `dst[size - 1]`. When `dst` has no NUL within `size` it writes
+ * nothing.
+ * @return `min(size, strlen(dst)) + strlen(src)`.
+ */
 size_t asm_strlcat(char* dst, const char* src, size_t size);
 
-/*==============================================================================
- * String comparison (strcmp.asm)
- *============================================================================*/
+/** @} */
 
-/* Compare two NUL-terminated strings. */
+/** @defgroup asm_cmp String comparison (strcmp.asm)
+ *  @{ */
+
+/** @brief Compare two NUL-terminated strings.
+ *  @return `<0`, `0` or `>0` using unsigned char values. */
 int asm_strcmp(const char* a, const char* b);
 
-/* Compare at most n bytes of two strings. */
+/** @brief Compare at most `n` bytes of two strings.
+ *  @return `<0`, `0` or `>0`; `0` also when the first `n` bytes are equal. */
 int asm_strncmp(const char* a, const char* b, size_t n);
 
-/* Case-insensitive comparison (C/POSIX/ASCII locale). */
+/** @brief Case-insensitive comparison (C/POSIX/ASCII locale). */
 int asm_strcasecmp(const char* a, const char* b);
 
-/* Case-insensitive comparison of at most n bytes. */
+/** @brief Case-insensitive comparison of at most `n` bytes. */
 int asm_strncasecmp(const char* a, const char* b, size_t n);
 
-/*==============================================================================
- * Searching (search.asm)
- *============================================================================*/
+/** @} */
 
-/* First occurrence of c in s (including the NUL when c == 0), or NULL. */
+/** @defgroup asm_search Searching (search.asm)
+ *  @{ */
+
+/** @brief First occurrence of `c` in `s` (including the NUL when `c == 0`).
+ *  @return Pointer to it, or `NULL`. */
 char* asm_strchr(const char* s, int c);
 
-/* Last occurrence of c in s (including the NUL when c == 0), or NULL. */
+/** @brief Last occurrence of `c` in `s` (including the NUL when `c == 0`).
+ *  @return Pointer to it, or `NULL`. */
 char* asm_strrchr(const char* s, int c);
 
-/* First occurrence of needle inside hay, or NULL. Empty needle returns hay. */
+/** @brief First occurrence of `needle` inside `hay`.
+ *  @return Pointer to it, or `NULL`; an empty `needle` returns `hay`. */
 char* asm_strstr(const char* hay, const char* needle);
 
-/* Binary-safe substring search inside an explicit-length buffer. */
+/** @brief Binary-safe substring search inside an explicit-length buffer.
+ *  @return Pointer to the match, or `NULL`. */
 void* asm_memmem(const void* hay, size_t hlen, const void* needle, size_t nlen);
 
-/* Length of the initial segment of s consisting of bytes from accept. */
+/** @brief Length of the initial segment of `s` consisting of bytes in `accept`. */
 size_t asm_strspn(const char* s, const char* accept);
 
-/* Length of the initial segment of s consisting of bytes NOT in accept. */
+/** @brief Length of the initial segment of `s` consisting of bytes not in
+ *         `accept`. */
 size_t asm_strcspn(const char* s, const char* accept);
 
-/* First byte of s that occurs in accept, or NULL. */
+/** @brief First byte of `s` that occurs in `accept`.
+ *  @return Pointer to it, or `NULL`. */
 char* asm_strpbrk(const char* s, const char* accept);
 
-/*==============================================================================
- * Character classification and conversion (ctype.asm)
- *------------------------------------------------------------------------------
- * Predicates return 1 for true and 0 for false.
- *============================================================================*/
+/** @} */
 
-int asm_toupper(int c);  /* upper-case ASCII letter -> lower case  */
-int asm_tolower(int c);  /* lower-case ASCII letter -> upper case  */
-int asm_isalpha(int c);  /* A-Z or a-z                              */
-int asm_isdigit(int c);  /* 0-9                                     */
-int asm_isalnum(int c);  /* alpha or digit                          */
-int asm_isspace(int c);  /* space, \t, \n, \v, \f, \r               */
-int asm_isupper(int c);  /* A-Z                                     */
-int asm_islower(int c);  /* a-z                                     */
-int asm_isxdigit(int c); /* hexadecimal digit                       */
-int asm_isprint(int c);  /* 0x20..0x7E                              */
-int asm_iscntrl(int c);  /* 0x00..0x1F or 0x7F                      */
-int asm_isgraph(int c);  /* 0x21..0x7E                              */
-int asm_ispunct(int c);  /* printable, non-alphanumeric             */
-int asm_isblank(int c);  /* space or horizontal tab                 */
+/** @defgroup asm_ctype Character classification and conversion (ctype.asm)
+ *  Predicates return 1 for true and 0 for false.
+ *  @{ */
 
-/*==============================================================================
- * Integer formatting (format.asm)
- *------------------------------------------------------------------------------
- * Bounded, NUL-terminating integer-to-string helpers. Each writes digits to
- * buf, then a NUL when cap > 0, and never writes more than cap bytes. The
- * return value is the number of characters the *full* representation needs,
- * excluding the NUL, so ret >= cap means the output was truncated. With
- * cap == 0 nothing is written and only the length is returned.
+int asm_toupper(int c);   /**< upper-case ASCII letter -> lower case */
+int asm_tolower(int c);   /**< lower-case ASCII letter -> upper case */
+int asm_isalpha(int c);   /**< A-Z or a-z                */
+int asm_isdigit(int c);   /**< 0-9                       */
+int asm_isalnum(int c);   /**< alpha or digit            */
+int asm_isspace(int c);   /**< space, \t, \n, \v, \f, \r */
+int asm_isupper(int c);   /**< A-Z                       */
+int asm_islower(int c);   /**< a-z                       */
+int asm_isxdigit(int c);  /**< hexadecimal digit         */
+int asm_isprint(int c);   /**< 0x20..0x7E                */
+int asm_iscntrl(int c);   /**< 0x00..0x1F or 0x7F        */
+int asm_isgraph(int c);   /**< 0x21..0x7E                */
+int asm_ispunct(int c);   /**< printable, non-alphanumeric */
+int asm_isblank(int c);   /**< space or horizontal tab   */
+
+/** @} */
+
+/** @defgroup asm_format Integer formatting (format.asm)
+ *  Bounded, NUL-terminating integer-to-string helpers. Each writes digits to
+ *  `buf`, then a NUL when `cap > 0`, and never writes more than `cap` bytes.
+ *  The return value is the number of characters the *full* representation
+ *  needs, excluding the NUL, so `ret >= cap` means the output was truncated.
+ *  With `cap == 0` nothing is written and only the length is returned.
  *
- * Digits are written most-significant first. `base` must be 2..36 and uses
- * 0-9 then a-z. Buffers must be large enough for the untruncated result if you
- * care about the complete string; a 21-byte buffer covers any uint64_t in
- * decimal, 65 bytes covers binary.
- *============================================================================*/
+ *  Digits are written most-significant first. `base` must be 2..36 and uses
+ *  `0-9` then `a-z`. Buffers must be large enough for the untruncated result if
+ *  you care about the complete string; a 21-byte buffer covers any `uint64_t`
+ *  in decimal, 65 bytes covers binary.
+ *  @{ */
 
-/* Unsigned decimal. */
+/** @brief Unsigned decimal. */
 size_t asm_u64toa(uint64_t value, char* buf, size_t cap);
 
-/* Signed decimal; emits a leading '-' for negative values (INT64_MIN is fine). */
+/** @brief Signed decimal; emits a leading '-' for negative values
+ *         (`INT64_MIN` is fine). */
 size_t asm_i64toa(int64_t value, char* buf, size_t cap);
 
-/* Unsigned in base 2..36 (lowercase letters). Returns 0 for a bad base. */
+/** @brief Unsigned in base 2..36 (lowercase letters).
+ *  @return The length, or 0 for a bad base. */
 size_t asm_u64toa_base(uint64_t value, char* buf, size_t cap, unsigned base);
 
-/* Unsigned hexadecimal without a "0x" prefix; uppercase when `uppercase`. */
+/** @brief Unsigned hexadecimal without a "0x" prefix; uppercase when
+ *         `uppercase` is non-zero. */
 size_t asm_u64tohex(uint64_t value, char* buf, size_t cap, int uppercase);
 
-/*==============================================================================
- * Minimal snprintf (format.asm)
- *------------------------------------------------------------------------------
- * `int asm_snprintf(char* dst, size_t size, const char* fmt, ...)`
+/** @} */
+
+/** @defgroup asm_snprintf Minimal snprintf (format.asm)
+ *  `int asm_snprintf(char* dst, size_t size, const char* fmt, ...)`
  *
- * A small, fast, freestanding replacement for the common integer/string cases
- * of snprintf. Semantics match C99 snprintf: at most size-1 bytes are written,
- * a NUL is stored when size > 0, and the return value is the number of bytes
- * that *would* have been written excluding the NUL (negative is never
- * returned). Not floating point, not locale aware, not async-signal-safe.
+ *  A small, fast, freestanding replacement for the common integer/string cases
+ *  of snprintf. Semantics match C99 snprintf: at most `size - 1` bytes are
+ *  written, a NUL is stored when `size > 0`, and the return value is the number
+ *  of bytes that *would* have been written excluding the NUL (negative is never
+ *  returned). Not floating point, not locale aware, not async-signal-safe.
  *
- * Supported conversions (an argument is consumed for each):
- *   %%  literal percent          %c  int -> one byte
- *   %s  char* (NULL -> "(null)")  %p  void* -> "0x" + lowercase hex, NULL -> "(nil)"
- *   %d  %i  signed decimal (int, or int64 with an l/ll length modifier)
- *   %u      unsigned decimal      %x %X  hexadecimal (lower/upper)
- *   %o      octal
- * Flags:   '-' left-justify, '0' zero-pad (numeric conversions; ignored for
- *          %s/%c and with '-'). Width: decimal digits only, no '*'.
- * Length:  'l' and 'll' both mean 64-bit for d/i/u/x/X/o; no h/z/j/t/L.
- * Anything else after '%' (including precision '.', '*', and %f/%e/%g/%a/%n)
- * is copied through literally as '%' plus that character and consumes no
- * argument. Widths above 2^31-1 are clamped.
- *============================================================================*/
+ *  Supported conversions (an argument is consumed for each):
+ *  | Spec | Meaning |
+ *  | ---- | ------- |
+ *  | `%%` | literal percent |
+ *  | `%c` | int -> one byte |
+ *  | `%s` | `char*` (`NULL` -> `"(null)"`) |
+ *  | `%p` | `void*` -> `"0x"` + lowercase hex (`NULL` -> `"(nil)"`) |
+ *  | `%d` `%i` | signed decimal (int, or int64 with an `l`/`ll` modifier) |
+ *  | `%u` | unsigned decimal |
+ *  | `%x` `%X` | hexadecimal (lower/upper) |
+ *  | `%o` | octal |
+ *
+ *  Flags: `-` left-justify, `0` zero-pad (numeric conversions; ignored for
+ *  `%s`/`%c` and with `-`). Width: decimal digits only, no `*`. Length: `l` and
+ *  `ll` both mean 64-bit for `d`/`i`/`u`/`x`/`X`/`o`; no `h`/`z`/`j`/`t`/`L`.
+ *  Anything else after `%` (including precision `.`, `*`, and
+ *  `%f`/`%e`/`%g`/`%a`/`%n`) is copied through literally as `%` plus that
+ *  character and consumes no argument. Widths above `2^31 - 1` are clamped.
+ *  @{ */
 
 int asm_snprintf(char* dst, size_t size, const char* fmt, ...);
 
-/*==============================================================================
- * Minimal, safe sscanf (format.asm / scan.asm)
- *------------------------------------------------------------------------------
- * `int asm_sscanf(const char* src, const char* fmt, ...)`
+/** @} */
+
+/** @defgroup asm_sscanf Minimal, safe sscanf (format.asm / scan.asm)
+ *  `int asm_sscanf(const char* src, const char* fmt, ...)`
  *
- * A small, freestanding replacement for the common integer/string cases of
- * sscanf. It never reads past the terminating NUL of src. Returns the number
- * of successful assignments, or -1 on an input failure before the first
- * conversion (like EOF) or on a malformed format.
+ *  A small, freestanding replacement for the common integer/string cases of
+ *  sscanf. It never reads past the terminating NUL of `src`.
+ *  @return The number of successful assignments, or `-1` on an input failure
+ *          before the first conversion (like EOF) or on a malformed format.
  *
- * Supported conversions (an argument is consumed unless '*'):
- *   %%  literal percent          %c  width bytes (default 1) into char*;
- *                                    no whitespace skip, no NUL added
- *   %s  whitespace-delimited into char*; a width is REQUIRED and at most
- *       width bytes plus a NUL are written (buffer must hold width+1)
- *   %d  %i  signed integer (%i auto-detects 0x/0X hex, leading-0 octal)
- *   %u  %x %X %o  unsigned
- *   %p  pointer as an optional 0x prefix followed by hex
- * Modifiers: '*' suppresses the assignment; a decimal width bounds the input
- * field; 'l'/'ll' select 64-bit for d/i/u/x/X/o. Overflowing values are
- * clamped to the destination type's range. There is deliberately no floating
- * point, scanset (%[...]), 'm' allocation, or %n.
- *============================================================================*/
+ *  Supported conversions (an argument is consumed unless `*`):
+ *  | Spec | Meaning |
+ *  | ---- | ------- |
+ *  | `%%` | literal percent |
+ *  | `%c` | width bytes (default 1) into `char*`; no whitespace skip, no NUL added |
+ *  | `%s` | whitespace-delimited into `char*`; a width is REQUIRED and at most `width` bytes plus a NUL are written (buffer must hold width+1) |
+ *  | `%d` `%i` | signed integer (`%i` auto-detects `0x`/`0X` hex, leading-0 octal) |
+ *  | `%u` `%x` `%X` `%o` | unsigned |
+ *  | `%p` | pointer as an optional `0x` prefix followed by hex |
+ *
+ *  Modifiers: `*` suppresses the assignment; a decimal width bounds the input
+ *  field; `l`/`ll` select 64-bit for `d`/`i`/`u`/`x`/`X`/`o`. Overflowing
+ *  values are clamped to the destination type's range. There is deliberately no
+ *  floating point, scanset (`%[...]`), `m` allocation, or `%n`.
+ *  @{ */
 
 int asm_sscanf(const char* src, const char* fmt, ...);
 
-/*==============================================================================
- * Arena allocator (arena.asm)
- *------------------------------------------------------------------------------
- * A chunked, resettable linear (bump) allocator. Every allocation is at
- * least 16-byte aligned and exhaustion returns NULL rather than overrunning
- * memory. It is single-threaded.
+/** @} */
+
+/** @defgroup asm_arena Arena allocator (arena.asm)
+ *  A chunked, resettable linear (bump) allocator. Every allocation is at least
+ *  16-byte aligned and exhaustion returns `NULL` rather than overrunning
+ *  memory. It is single-threaded.
  *
- * The struct layout is part of the ABI; do not reorder the fields.
- *============================================================================*/
+ *  The struct layout is part of the ABI; do not reorder the fields.
+ *  @{ */
 
-typedef struct asm_arena_chunk asm_arena_chunk; /* opaque */
+/** @brief Opaque arena chunk header. */
+typedef struct asm_arena_chunk asm_arena_chunk;
 
+/** @brief Chunked linear allocator state. */
 typedef struct asm_arena {
-    unsigned char* ptr;                              /* next free byte in the current chunk      */
-    unsigned char* end;                              /* end of the current chunk                 */
-    asm_arena_chunk* cur;                            /* current (newest) chunk                   */
-    asm_arena_chunk* first;                          /* first chunk; reset() rewinds to it       */
-    void* (*alloc)(size_t size, void* ctx);          /* backing allocator */
-    void (*free)(void* ptr, size_t size, void* ctx); /* release   */
-    void* ctx;                                       /* backing allocator context                */
-    size_t chunk;                                    /* default size for new growable chunks     */
-    size_t total;                                    /* usable bytes across all chunks           */
-    size_t used;                                     /* bytes handed out since the last reset    */
-    size_t peak;                                     /* high-water mark of `used`                */
+    unsigned char* ptr;                              /**< next free byte in the current chunk */
+    unsigned char* end;                              /**< end of the current chunk            */
+    asm_arena_chunk* cur;                            /**< current (newest) chunk              */
+    asm_arena_chunk* first;                          /**< first chunk; reset() rewinds to it  */
+    void* (*alloc)(size_t size, void* ctx);          /**< backing allocator                   */
+    void (*free)(void* ptr, size_t size, void* ctx); /**< release                             */
+    void* ctx;                                       /**< backing allocator context           */
+    size_t chunk;                                    /**< default size for new growable chunks */
+    size_t total;                                    /**< usable bytes across all chunks      */
+    size_t used;                                     /**< bytes handed out since last reset   */
+    size_t peak;                                     /**< high-water mark of `used`           */
 } asm_arena;
 
-/* Scoped rollback token for asm_arena_mark/asm_arena_release. */
+/** @brief Scoped rollback token for asm_arena_mark()/asm_arena_release(). */
 typedef struct asm_mark {
     asm_arena_chunk* chunk;
     unsigned char* ptr;
     size_t used;
 } asm_mark;
 
-/* Initialise a fixed arena over caller-owned buf of `size` bytes.
- * The first 64 bytes are reserved for bookkeeping. Returns 0, or -1. */
+/**
+ * @brief Initialise a fixed arena over caller-owned `buf` of `size` bytes.
+ * @return 0 on success, or -1. The first 64 bytes are reserved for bookkeeping.
+ */
 int asm_arena_init(asm_arena* a, void* buf, size_t size);
 
-/* Initialise a growable arena. alloc(size, ctx) must return 16-byte aligned
- * memory or NULL; free(ptr, size, ctx) may be NULL. Returns 0, or -1. */
+/**
+ * @brief Initialise a growable arena.
+ * @param alloc Must return 16-byte aligned memory or NULL.
+ * @param free  May be NULL.
+ * @return 0, or -1.
+ */
 int asm_arena_init_grow(asm_arena* a, void* (*alloc)(size_t size, void* ctx),
                         void (*free)(void* ptr, size_t size, void* ctx), void* ctx,
                         size_t chunk_size);
 
-/* Growable arena whose chunks come from anonymous mmap (Linux x86-64). This
- * needs no libc and no caller-supplied allocator. Returns 0, or -1. */
+/**
+ * @brief Growable arena whose chunks come from anonymous mmap (Linux x86-64).
+ *
+ * Needs no libc and no caller-supplied allocator.
+ * @return 0, or -1.
+ */
 int asm_arena_init_mmap(asm_arena* a, size_t chunk_size);
 
-/* Allocate at least `size` bytes (16-byte aligned), or NULL. */
+/** @brief Allocate at least `size` bytes (16-byte aligned), or `NULL`. */
 void* asm_arena_alloc(asm_arena* a, size_t size);
 
-/* Allocate `size` bytes aligned to `align` (a power of two), or NULL. */
+/** @brief Allocate `size` bytes aligned to `align` (a power of two), or `NULL`. */
 void* asm_arena_alloc_aligned(asm_arena* a, size_t size, size_t align);
 
-/* Allocate count*size zeroed bytes, or NULL. */
+/** @brief Allocate `count * size` zeroed bytes, or `NULL`. */
 void* asm_arena_calloc(asm_arena* a, size_t count, size_t size);
 
-/* Resize an allocation. Grows in place when it is the most recent block,
- * otherwise moves and copies min(old, nw) bytes. ptr may be NULL. */
+/**
+ * @brief Resize an allocation.
+ *
+ * Grows in place when it is the most recent block, otherwise moves and copies
+ * `min(old, nw)` bytes. `ptr` may be NULL.
+ */
 void* asm_arena_realloc(asm_arena* a, void* ptr, size_t old, size_t nw);
 
-/* Snapshot the current position for scoped rollback. */
+/** @brief Snapshot the current position for scoped rollback. */
 void asm_arena_mark(const asm_arena* a, asm_mark* m);
 
-/* Roll back to a mark, releasing all newer chunks. Returns 0, or -1 if the
- * mark does not belong to this arena. */
+/**
+ * @brief Roll back to a mark, releasing all newer chunks.
+ * @return 0, or -1 if the mark does not belong to this arena.
+ */
 int asm_arena_release(asm_arena* a, const asm_mark* m);
 
-/* Release every chunk except the first and rewind to its start. */
+/** @brief Release every chunk except the first and rewind to its start. */
 void asm_arena_reset(asm_arena* a);
 
-/* Release all chunks (if a free callback is set) and clear the arena. */
+/** @brief Release all chunks (if a free callback is set) and clear the arena. */
 void asm_arena_destroy(asm_arena* a);
 
-/* Bytes handed out since the last reset. */
+/** @brief Bytes handed out since the last reset. */
 size_t asm_arena_used(const asm_arena* a);
 
-/* High-water mark of asm_arena_used() since the last reset. */
+/** @brief High-water mark of asm_arena_used() since the last reset. */
 size_t asm_arena_peak(const asm_arena* a);
 
-/* Free bytes remaining in the current chunk. */
+/** @brief Free bytes remaining in the current chunk. */
 size_t asm_arena_remaining(const asm_arena* a);
 
-/* Total usable bytes currently backed by all chunks. */
+/** @brief Total usable bytes currently backed by all chunks. */
 size_t asm_arena_capacity(const asm_arena* a);
 
-/*==============================================================================
- * Opaque OS memory primitives (sys.asm, Linux x86-64)
- *------------------------------------------------------------------------------
- * Anonymous mmap/munmap. asm_sys_alloc/asm_sys_free match the arena callback
- * signatures and can be passed to asm_arena_init_grow().
- *============================================================================*/
+/** @} */
 
-void* asm_sys_mmap(size_t size);                      /* page-aligned or NULL */
-int asm_sys_munmap(void* ptr, size_t size);           /* 0 or -errno          */
-void* asm_sys_alloc(size_t size, void* ctx);          /* arena alloc callback */
-void asm_sys_free(void* ptr, size_t size, void* ctx); /* arena free cb   */
+/** @defgroup asm_sys Opaque OS memory primitives (sys.asm, Linux x86-64)
+ *  Anonymous mmap/munmap. asm_sys_alloc()/asm_sys_free() match the arena
+ *  callback signatures and can be passed to asm_arena_init_grow().
+ *  @{ */
 
-/*==============================================================================
- * malloc-style allocator (alloc.asm)
- *------------------------------------------------------------------------------
- * A segregated free-list allocator served directly by mmap, with no libc
- * dependency. Every pointer is 16-byte aligned.
+void* asm_sys_mmap(size_t size);                      /**< page-aligned or NULL  */
+int asm_sys_munmap(void* ptr, size_t size);           /**< 0 or -errno           */
+void* asm_sys_alloc(size_t size, void* ctx);          /**< arena alloc callback  */
+void asm_sys_free(void* ptr, size_t size, void* ctx); /**< arena free callback   */
+
+/** @} */
+
+/** @defgroup asm_alloc malloc-style allocator (alloc.asm)
+ *  A segregated free-list allocator served directly by mmap, with no libc
+ *  dependency. Every pointer is 16-byte aligned.
  *
- * IMPORTANT: these manage their own heap; a pointer from asm_malloc must be
- * released with asm_free and never with libc free (and vice versa). The
- * allocator is single-threaded.
- *============================================================================*/
+ *  @warning These manage their own heap; a pointer from asm_malloc() must be
+ *  released with asm_free() and never with libc `free` (and vice versa). The
+ *  allocator is single-threaded.
+ *  @{ */
 
 void* asm_malloc(size_t size);
 void* asm_calloc(size_t count, size_t size);
 void* asm_realloc(void* ptr, size_t size);
 void asm_free(void* ptr);
 
-/* Resize ptr to count*size bytes, rejecting any 64-bit overflow of the
- * product (returns NULL and leaves ptr valid). */
+/**
+ * @brief Resize `ptr` to `count * size` bytes.
+ * @return The new block, or `NULL` on 64-bit overflow of the product (leaving
+ *         `ptr` valid).
+ */
 void* asm_reallocarray(void* ptr, size_t count, size_t size);
 
-/* Allocate size bytes aligned to alignment (a non-zero power of two). */
+/** @brief Allocate `size` bytes aligned to `alignment` (a non-zero power of
+ *         two). */
 void* asm_aligned_alloc(size_t alignment, size_t size);
 
-/* POSIX posix_memalign: 0 on success, EINVAL(22) for a bad alignment or
- * ENOMEM(12) on failure; *memptr is left untouched on both error paths. */
+/**
+ * @brief POSIX posix_memalign.
+ * @return 0 on success, `EINVAL` (22) for a bad alignment or `ENOMEM` (12) on
+ *         failure; `*memptr` is left untouched on both error paths.
+ */
 int asm_posix_memalign(void** memptr, size_t alignment, size_t size);
 
-/* Usable payload bytes in a block from asm_malloc, or 0 for NULL. */
+/** @brief Usable payload bytes in a block from asm_malloc(), or 0 for `NULL`. */
 size_t asm_malloc_usable_size(void* ptr);
+
+/**
+ * @brief Flush the calling thread's thread-local cache back to the shared heap.
+ * @return How many small blocks were returned.
+ *
+ * Call it from a thread-exit hook so a short-lived thread does not strand its
+ * per-thread cache budget. The portable (wasm) backend has no cache and
+ * returns 0.
+ */
+size_t asm_alloc_flush_tcache(void);
+
+/** @} */
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
 
-/*==============================================================================
- * Optional: map the standard libc names onto the asm_* routines.
- * Define ASMLIB_ENABLE_LIBC_ALIASES to activate. This is deliberately opt-in.
- *============================================================================*/
+/**
+ * @defgroup asm_aliases Optional libc name mapping
+ * Map the standard libc names onto the `asm_*` routines. Define
+ * ::ASMLIB_ENABLE_LIBC_ALIASES to activate. This is deliberately opt-in.
+ * @{
+ */
 #ifdef ASMLIB_ENABLE_LIBC_ALIASES
 #define memcpy      asm_memcpy
 #define mempcpy     asm_mempcpy
@@ -447,5 +586,19 @@ size_t asm_malloc_usable_size(void* ptr);
 #define posix_memalign     asm_posix_memalign
 #define aligned_alloc      asm_aligned_alloc
 #endif /* ASMLIB_ENABLE_LIBC_ALIASES */
+/** @} */
+
+/**
+ * @addtogroup asm_umbrella
+ * @{
+ * The freestanding math library and the vector/matrix/quaternion API are pulled
+ * in here so a program only needs `#include "asmlib.h"`. They are header-only
+ * (static inline), so including them costs nothing unless used, and the linking
+ * requirements are unchanged.
+ * @}
+ */
+#include "asmlib_math.h"
+#include "asmlib_vec.h"
+#include "asmlib_matrix.h"
 
 #endif /* ASMLIB_H */

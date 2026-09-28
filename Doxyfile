@@ -1,0 +1,74 @@
+# Doxyfile - API reference configuration for asmlib.
+#
+#   make docs            # requires doxygen; output in build/docs/html
+#   doxygen Doxyfile      # equivalently, directly
+#
+# The public contract lives in include/; the prose pages (README, docs/) are
+# pulled in as markdown and the README becomes the front page.
+
+PROJECT_NAME           = "asmlib"
+PROJECT_NUMBER         = 1.0.0
+PROJECT_BRIEF          = "Hand-written x86-64 (AVX2/BMI2) and AArch64 (NEON) memory, string and math routines"
+OUTPUT_DIRECTORY       = build/docs
+OUTPUT_LANGUAGE        = English
+CREATE_SUBDIRS         = NO
+ALLOW_UNICODE_NAMES    = NO
+BRIEF_MEMBER_DESC      = YES
+REPEAT_BRIEF           = YES
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = NO
+MULTILINE_CPP_IS_BRIEF = NO
+MARKDOWN_SUPPORT       = YES
+TOC_INCLUDE_HEADINGS   = 2
+AUTOLINK_SUPPORT       = YES
+
+# Input: the headers plus the markdown documentation.
+INPUT                  = include README.md docs
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.h *.md
+RECURSIVE              = YES
+EXCLUDE                = build
+EXCLUDE_PATTERNS       = */build/* */.git/*
+EXAMPLE_PATH           = examples
+
+# Everything in include/ is part of the public API; document it even where a
+# symbol has no explicit comment (the vec/matrix/simd headers are large).
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_AS_ERROR          = NO
+QUIET                  = YES
+
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = NO
+TAB_SIZE               = 4
+
+# Output: HTML only. No Graphviz dependency.
+GENERATE_HTML          = YES
+HTML_DYNAMIC_SECTIONS  = YES
+SEARCHENGINE           = YES
+DISABLE_INDEX          = NO
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+GENERATE_XML           = NO
+GENERATE_DOCBOOK       = NO
+GENERATE_AUTOGEN_DEF   = NO
+GENERATE_PERLMOD       = NO
+
+HAVE_DOT               = NO
+CLASS_DIAGRAMS         = NO
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = YES
+REFERENCED_BY_RELATION = NO
+REFERENCES_RELATION    = NO
+VERBATIM_HEADERS       = YES
+ALPHABETICAL_INDEX     = YES
+
+USE_MDFILE_AS_MAINPAGE = README.md

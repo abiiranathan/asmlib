@@ -1,0 +1,18 @@
+# pkg-config template for the CMake install.
+#
+# Relocatable: the prefix is derived from the location of this .pc file
+# (${pcfiledir}/../.. = <prefix>), so `cmake --install --prefix <dir>` produces
+# a working file regardless of the configure-time CMAKE_INSTALL_PREFIX.
+# Configured with @ONLY, so ${pcfiledir}, ${prefix}, ... are left untouched.
+
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: asmlib
+Description: Hand-written x86-64 and AArch64 assembly libc subset, with a freestanding wasm/math backend
+URL: https://github.com/abiiranathan/asmlib
+Version: @ASMLIB_VERSION@
+Libs: -L${libdir} -lasmlib
+Cflags: -I${includedir}

@@ -1,6 +1,6 @@
-/*==============================================================================
- * asmlib_math.h - freestanding double-precision math library
- *------------------------------------------------------------------------------
+/**
+ * @file asmlib_math.h
+ * @brief Freestanding double-precision math library.
  * SPDX-License-Identifier: MIT
  *
  * A libc-free, WebAssembly-friendly reimplementation of the C <math.h>

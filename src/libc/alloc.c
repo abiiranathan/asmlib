@@ -86,6 +86,21 @@ static inline void asm_unlock(void) {
 #define POOL_EINVAL   22                              /* EINVAL                   */
 #define POOL_ENOMEM   12                              /* ENOMEM                   */
 
+/*------------------------------------------------------------------------------
+ * Debug mode (ASMLIB_ALLOC_DEBUG)
+ *------------------------------------------------------------------------------
+ * Fills fresh payloads with 0xCD and freed blocks with 0xDD, traps on a double
+ * free or on a corrupt/misaligned pointer, and tracks live block/byte counts so
+ * a harness can detect leaks. Off by default; it changes timing, not the API.
+ *----------------------------------------------------------------------------*/
+#ifdef ASMLIB_ALLOC_DEBUG
+#define POISON_ALLOC 0xCD
+#define POISON_FREE  0xDD
+static size_t dbg_live_blocks;
+static size_t dbg_live_bytes;
+static void alloc_debug_fail(void) { __builtin_trap(); }
+#endif
+
 #if !defined(__wasm__)
 #  ifndef ASM_PORTABLE_HEAP_SIZE
 #    define ASM_PORTABLE_HEAP_SIZE (16u * 1024u * 1024u)
@@ -334,6 +349,11 @@ static void *alloc_locked(size_t size) {
         fl_coalesce(rest);
     }
     b->flags = 0;
+#ifdef ASMLIB_ALLOC_DEBUG
+    mem_fill(blk_payload(b), POISON_ALLOC, size);
+    dbg_live_blocks++;
+    dbg_live_bytes += b->size;
+#endif
     return blk_payload(b);
 }
 
@@ -380,11 +400,25 @@ static void free_locked(void *ptr) {
     pool_block *h;
 
     if (ptr == NULL) return;
+#ifdef ASMLIB_ALLOC_DEBUG
+    if ((uintptr_t)ptr % POOL_ALIGN != 0) alloc_debug_fail();       /* misaligned  */
+#endif
     h = blk_header(ptr);
+#ifdef ASMLIB_ALLOC_DEBUG
+    if ((unsigned char *)h < pool_start || (unsigned char *)h + POOL_HDR > pool_end)
+        alloc_debug_fail();                                          /* not our heap */
+    if (h->flags & ~(size_t)(BLK_FREE | BLK_INDIRECT)) alloc_debug_fail();
+#endif
     if (h->flags & BLK_INDIRECT) {
         free_locked((unsigned char *)ptr - h->size);
         return;
     }
+#ifdef ASMLIB_ALLOC_DEBUG
+    if (h->flags & BLK_FREE) alloc_debug_fail();                     /* double free */
+    mem_fill(blk_payload(h), POISON_FREE, h->size - POOL_HDR);
+    if (dbg_live_blocks) dbg_live_blocks--;
+    dbg_live_bytes = (dbg_live_bytes >= h->size) ? dbg_live_bytes - h->size : 0;
+#endif
     h->flags = BLK_FREE;
     fl_insert(h);
     fl_coalesce(h);
@@ -547,3 +581,29 @@ int ASM_LIBC(posix_memalign)(void **memptr, size_t alignment, size_t size) {
     *memptr = p;
     return 0;
 }
+
+/*------------------------------------------------------------------------------
+ * size_t asm_alloc_flush_tcache(void)
+ *------------------------------------------------------------------------------
+ * The portable allocator has no per-thread cache, so there is nothing to
+ * return; this exists so the API matches the native backend.
+ *----------------------------------------------------------------------------*/
+size_t ASM_LIBC(alloc_flush_tcache)(void) { return 0; }
+
+#ifdef ASMLIB_ALLOC_DEBUG
+/* Live allocation counts for a leak check (debug builds only). */
+size_t ASM_LIBC(alloc_debug_live_blocks)(void) {
+    size_t n;
+    asm_lock();
+    n = dbg_live_blocks;
+    asm_unlock();
+    return n;
+}
+size_t ASM_LIBC(alloc_debug_live_bytes)(void) {
+    size_t n;
+    asm_lock();
+    n = dbg_live_bytes;
+    asm_unlock();
+    return n;
+}
+#endif

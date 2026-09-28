@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: asmlib
+Description: Hand-written x86-64 and AArch64 assembly libc subset, with a freestanding wasm/math backend
+URL: https://github.com/abiiranathan/asmlib
+Version: @VERSION@
+Libs: -L${libdir} -lasmlib
+Cflags: -I${includedir}

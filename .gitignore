@@ -1,5 +1,6 @@
 # Build artefacts
 /build/
+/build-cmake/
 *.wasm
 
 # Editor / OS noise

@@ -21,6 +21,9 @@
 
 #ifdef ASMLIB_LIBC_STD_NAMES
 #define ASM_LIBC(name) name
+#elif defined(ASMLIB_LIBC_SCALAR_PREFIX)
+/* Built as the scalar half of the x86-64 runtime dispatcher. */
+#define ASM_LIBC(name) asm_scalar_##name
 #else
 #define ASM_LIBC(name) asm_##name
 #endif
@@ -76,5 +79,14 @@ size_t asm_u64toa_base(unsigned long long value, char *buf, size_t cap, unsigned
 size_t asm_u64tohex(unsigned long long value, char *buf, size_t cap, int uppercase);
 int    ASM_LIBC(snprintf)(char *dst, size_t size, const char *fmt, ...);
 int    ASM_LIBC(sscanf)(const char *src, const char *fmt, ...);
+
+/* No-op on the portable backend (no per-thread cache). */
+size_t ASM_LIBC(alloc_flush_tcache)(void);
+
+#ifdef ASMLIB_ALLOC_DEBUG
+/* Debug builds: live allocation counts for leak checks. */
+size_t ASM_LIBC(alloc_debug_live_blocks)(void);
+size_t ASM_LIBC(alloc_debug_live_bytes)(void);
+#endif
 
 #endif /* ASMLIB_PORTABLE_H */

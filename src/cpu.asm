@@ -127,4 +127,46 @@ asm_cpu_has_avx2:
     movzx   eax, al                     ; zero-extend al into eax (0 or 1)
     ret                                 ; return the predicate in eax
 
+;==============================================================================
+; void asm_cpu_require_avx2(void)
+;------------------------------------------------------------------------------
+; Fails fast when the CPU cannot run the vectorised routines: if AVX2 and BMI1
+; are not both usable, writes a short message to stderr and exits the process
+; with status 2 (raw write(2) + exit_group(2), no libc). Returns normally when
+; the CPU is supported. Call it once at startup for a clear error instead of a
+; SIGILL deep inside a vector routine.
+;
+; Parameters (System V AMD64 ABI):
+;   none
+; Returns:
+;   nothing (does not return when AVX2/BMI1 are missing)
+; Uses / clobbers:
+;   reads CPUID; clobbers rax, rcx, rdx, rdi, rsi, r8, r10, r11
+;==============================================================================
+global asm_cpu_require_avx2:function
+asm_cpu_require_avx2:
+    sub     rsp, 8                      ; align the stack for the call
+    call    asm_cpu_features            ; rax = feature mask
+    add     rsp, 8                      ; drop the alignment slot
+    and     eax, FEAT_AVX2 | FEAT_BMI1  ; the two features the library needs
+    cmp     eax, FEAT_AVX2 | FEAT_BMI1
+    je      .ok                         ; both present -> return normally
+    ; ---- write(2, msg, len) ----
+    mov     eax, 1                      ; SYS_write
+    mov     edi, 2                      ; fd = stderr
+    lea     rsi, [rel L_cpu_msg]
+    mov     edx, L_cpu_msg_len
+    syscall
+    ; ---- exit_group(2) ----
+    mov     eax, 231                    ; SYS_exit_group
+    mov     edi, 2                      ; status = 2
+    syscall
+    ud2                                 ; never reached
+.ok:
+    ret
+
+section .rodata
+L_cpu_msg: db "asmlib: this CPU lacks AVX2/BMI1; the vector routines cannot run.", 10
+L_cpu_msg_len equ $ - L_cpu_msg
+
 GNU_STACK_NOTE                          ; emit the non-executable .note.GNU-stack section

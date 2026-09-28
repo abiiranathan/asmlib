@@ -8,18 +8,19 @@ backend (NASM, AVX2/BMI2) and an AArch64 backend (GNU assembly, NEON), exposing
 the same `asm_*` API. A portable C backend (`src/libc/`) and a libc-free math
 library (`src/math/`) bring that same surface to WebAssembly and other
 freestanding targets. It is small, self-contained (nothing beyond the assembler,
-compiler and linker), thoroughly tested against libc, and packaged with a C
-header plus static and shared libraries.
+compiler and linker), thoroughly tested against libc, and packaged as one C
+header (`asmlib.h`, which also pulls in the math and vector/matrix APIs) plus
+static and shared libraries.
 
 ```
 src/        NASM sources (memory, string, comparison, search, ctype, alloc, format, scan)
 src/aarch64/ hand-written AArch64 assembly port (same API, NEON)
 src/math/   freestanding C math library (no libc; builds for wasm32)
 src/libc/   portable C memory/string/allocator/format/scan backend for wasm/freestanding
-include/    asmlib.h — the public C API; asmlib_math.h — the math API
-tests/      differential + page-boundary + arena + malloc + format + scan + math + portable
+include/    asmlib.h / asmlib_math.h / asmlib_vec.h / asmlib_matrix.h
+tests/      differential + page-boundary + arena + malloc + format + scan + linalg + math
 bench/      asmlib vs. libc micro-benchmarks (routines, allocators, formatting, scanning)
-examples/   word-frequency analyser and the wasm double-pendulum demo
+examples/   word-frequency analyser + wasm double-pendulum and image-editor demos
 ```
 
 ## Platforms
@@ -44,6 +45,11 @@ math library.
 * **SIMD where it wins.** 32-byte AVX2/BMI scans (`vpsubb`, `vpminub`,
   `tzcnt`/`bsr`) on x86-64 and NEON (`cmeq`/`umaxv`, `ldp`/`stp`) on AArch64,
   both with branchless ASCII case folding.
+* **One library, any x86-64.** The memory/string/comparison/search entry
+  points are resolved by the dynamic loader (ELF IFUNC on hosted Linux) to AVX2
+  or to a portable scalar implementation, so a single binary degrades gracefully
+  on pre-Haswell CPUs with **no per-call dispatch cost**;
+  `#include "asmlib.h"` is the whole API.
 * **OS memory from raw syscalls.** `mmap`/`munmap` wrappers (Linux x86-64 and
   AArch64) let both the arena and the malloc heap obtain memory with no libc
   and no caller-supplied allocator.
@@ -57,6 +63,10 @@ math library.
   (1.5–4x glibc) and `asm_sscanf` (2–3x glibc). Every `%s`/`%c` read is bounded
   by a required width and the scanner never reads past the input's NUL; no
   floating point, precision or locale.
+* **Vector, matrix and quaternion math.** `asmlib_vec.h` and `asmlib_matrix.h` port
+the solidc Vec2/3/4, Mat3/Mat4 and Quat API (~200 operations) to a
+freestanding, header-only library built on asmlib's own math routines — no
+libc, no libm, and it compiles on x86-64, AArch64 and wasm32.
 * **Freestanding math library** for WebAssembly and bare-metal targets: 112
   double- and single-precision routines (`sin`/`sinf`, `log`/`logf`,
   `pow`/`powf`, `cbrt`, `erf`, …) in portable C with no libc, no `libm`, no
@@ -80,14 +90,23 @@ math library.
 
 ## Runtime requirements
 
-On x86-64 the library requires **AVX2** and **BMI1** (`tzcnt`) at run time and
-does not fall back to scalar code, so query support before using it on older
-CPUs:
+One library runs on any x86-64 CPU. The memory/string/comparison/search entry
+points are **resolved once, by the loader**: on hosted Linux x86-64 each public
+symbol is an ELF indirect function (`src/dispatch_ifunc.c`, `STT_GNU_IFUNC`)
+whose resolver returns the hand-written AVX2 routine when the CPU has AVX2 + the
+OS enables its state, otherwise the portable scalar routine (the same code the
+wasm build uses). There is no branch on the hot path. On other hosts a portable
+forwarder is used (`src/dispatch.c`), which probes AVX2 + BMI1 lazily on the
+first call. Either way there is no error, no environment variable, no separate
+library. `asm_cpu_has_avx2()` reports the choice; `asm_cpu_require_avx2()` is
+available if a program would rather fail fast (message + `exit(2)`) than run the
+slower path.
 
-```c
-#include "asmlib.h"
-if (!asm_cpu_has_avx2()) { /* use libc instead */ }
-```
+`make test-fallback` runs the differential suites under QEMU with a CPU that has
+no AVX2 (Nehalem), which exercises the scalar path end to end. For a purely
+scalar build there is also `make scalar-lib` → `build/libasmlib_scalar.a` (the
+portable C backend, no SSE4.1/FMA, same `asm_*` names); the `-nostdlib`
+freestanding test links that archive, since IFUNC relocations need a C runtime.
 
 The native math kernels additionally use FMA (`-mfma`), which AVX2 implies on
 every real CPU; the wasm32 build uses no FMA. On AArch64, NEON is part of the
@@ -100,6 +119,7 @@ there by design.
 make            # build/build/libasmlib.a and build/libasmlib.so
 make test       # run the full test suite
 make test-asan  # run it under AddressSanitizer + UndefinedBehaviorSanitizer
+make fuzz       # libFuzzer: converters, snprintf, sscanf, linalg (needs clang)
 make test-valgrind  # run it under valgrind memcheck (OOB + leak checks)
 make bench      # run the string/memory benchmark vs. libc
 make bench-arena    # arena and asm_malloc vs. libc malloc (same binary)
@@ -109,16 +129,77 @@ make bench-scan     # asm_sscanf vs. libc sscanf
 make example    # run the word-frequency example
 make test-math  # run the freestanding double-precision math differential tests
 make test-libc  # run the portable (wasm) memory/string/allocator tests
+make test-freestanding  # -nostdlib smoke: arena/math/format/scan/linalg, no OS
+make scalar-lib # non-AVX2 fallback library (portable C backend)
+make test-scalar    # run the portable tests against the scalar library
+make test-fallback  # run the differential suites with no AVX2 (under qemu)
 make test-mt    # run the multithreaded allocator stress tests
 make bench-math # benchmark the math library against the host libm
 make wasm       # build the freestanding wasm32 module (math + portable libc)
 make wasm-lib   # build the double-pendulum library module (clean C ABI)
 make wasm-serve # serve the browser double-pendulum UI on :8000
 make wasm-example   # non-interactive check of the pendulum library module
+make wasm-image     # build the image-editing wasm module
+make wasm-image-example # non-interactive check of the image module
+make wasm-image-serve   # serve the image-editor UI on :8000
 make aarch64        # cross-build the AArch64 port (aarch64-linux-gnu-gcc)
 make test-aarch64   # run the AArch64 suites under qemu-aarch64-static
+make docs       # build the HTML API reference (Doxygen) -> build/docs/html
 make clean
 ```
+
+### With CMake
+
+The library (static, shared and the scalar fallback) and its install rules can
+also be driven by CMake, as an alternative to the Makefile:
+
+```sh
+cmake -S . -B build-cmake
+cmake --build build-cmake
+cmake --install build-cmake --prefix /usr/local
+```
+
+This installs the headers, `libasmlib.{a,so}`, `libasmlib_scalar.a`, a
+relocatable `asmlib.pc`, and a CMake package config. Consumers can then use
+
+```cmake
+find_package(asmlib 1.0 REQUIRED)
+target_link_libraries(app PRIVATE asmlib::asmlib)          # shared
+# target_link_libraries(app PRIVATE asmlib::asmlib_static) # static
+# target_link_libraries(app PRIVATE asmlib::asmlib_scalar) # scalar fallback
+```
+
+or, straight from a checkout, `add_subdirectory(path/to/asmlib)` and link the
+same targets (install rules are off when it is embedded).
+
+CMake builds the same two hand-written backends as the Makefile, selected from
+the target processor: x86-64 (NASM, with the AVX2/scalar dispatch) and AArch64
+(GNU as, NEON). Cross-compiling to AArch64 uses the bundled toolchain file:
+
+```sh
+cmake -S . -B build-aarch64 -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64.cmake
+cmake --build build-aarch64
+```
+
+The test suite, wasm and fuzzing targets stay on `make`.
+
+## Installing
+
+`make install [PREFIX=/usr/local] [DESTDIR=stage] [LIBDIR=...] [INCLUDEDIR=...]`
+installs the headers, the static and shared libraries, the scalar fallback
+library and an `asmlib.pc` pkg-config file:
+
+```sh
+make install PREFIX=/usr/local DESTDIR=/tmp/stage
+cc $(pkg-config --cflags asmlib) app.c $(pkg-config --libs asmlib)
+make uninstall PREFIX=/usr/local DESTDIR=/tmp/stage
+```
+
+The CMake build installs the same layout plus a package config
+(`find_package(asmlib)` → `asmlib::asmlib`); see [With CMake](#with-cmake).
+
+The version is defined in `include/asmlib_version.h` (`ASMLIB_VERSION_STRING`,
+`ASMLIB_VERSION_NUMBER`) and available at run time from `asm_version()`.
 
 ## Using the library
 
@@ -319,13 +400,22 @@ small blocks (initial-exec TLS on x86-64, local-exec on AArch64), so the hot
 `asm_malloc`/`asm_free` path touches no lock at all; a single global spinlock
 only serialises run refills, over-budget frees, large mappings and the aligned
 machinery. The cache is bounded by a per-thread byte budget (1 MiB) so memory
-cannot grow without limit — but blocks still in a thread's cache when it exits
-are not reclaimed, since flushing them would require a pthread/libc exit hook.
-(The lock makes the allocator not async-signal-safe, and the arena allocator
-remains single-threaded by design.) Small-class runs are retained for reuse.
+cannot grow without limit. A thread that exits with a partially filled cache
+would strand it; call `asm_alloc_flush_tcache()` from a pthread key destructor
+(a thread-exit hook) to return those blocks to the shared heap — the portable
+wasm backend has no cache and returns 0. (The lock makes the allocator not
+async-signal-safe, and the arena allocator remains single-threaded by design.)
+Small-class runs are retained for reuse.
 `asm_posix_memalign`/`asm_aligned_alloc` support any power-of-two alignment
 via a small indirect header, and the resulting pointers are released normally
 with `asm_free` (and may be passed to `asm_realloc`).
+
+Building the library with `-DASMLIB_ALLOC_DEBUG` (NASM `-D` for the x86-64
+backend, the C define for the portable one) hardens the heap: the native
+allocator traps on a double free of a small block, and the portable backend
+also fills freed/fresh payloads with `0xDD`/`0xCD`, rejects misaligned or
+foreign pointers, and reports live block/byte counts via
+`asm_alloc_debug_live_blocks()`/`asm_alloc_debug_live_bytes()`.
 
 ```c
 char *buf = asm_malloc(256);
@@ -395,6 +485,39 @@ depend on the host libm. `make wasm` compiles every math and `src/libc` source
 to `wasm32` and links `build/asmlib.wasm`; the module has **no imports** and
 exports the standard names (`sin`, `exp`, …, `memcpy`, `strlen`, `malloc`, …),
 so it is a drop-in freestanding libm + libc subset for WebAssembly.
+
+### Vector, matrix and quaternion math (`asmlib_vec.h`, `asmlib_matrix.h`)
+
+A port of the solidc `vec.h`/`matrix.h` API: `asm_vec2`/`asm_vec3`/`asm_vec4`
+storage types, `asm_simd_vec2`/`asm_simd_vec3`/`asm_simd_vec4` compute types,
+`asm_mat3`/`asm_mat4` and `asm_quat`, with ~200 operations (add/sub/mul, dot,
+cross, normalise, project/reject, reflect/refract, lerp, rotations, matrix
+multiply/inverse/transpose/determinant, perspective/look-at/unproject, and
+quaternion axis-angle/euler/mul/slerp conversions).
+
+The headers are header-only and freestanding: they call asmlib's own
+`asm_sqrtf`/`asm_sinf`/`asm_cosf`/`asm_atan2f`/`asm_expf`/`asm_tanhf`/… routines
+(via `ASM_MATH`), so there is no libc and no libm. The freestanding math objects
+are linked into `libasmlib.a`/`libasmlib.so`, so a native program only needs
+`-lasmlib`; for the wasm module compile the headers with
+`-DASMLIB_MATH_STD_NAMES` to match the exported names.
+
+```c
+#include "asmlib_matrix.h"
+
+asm_simd_vec3 n = asm_vec3_normalize(asm_vec3_load((asm_vec3){3, 4, 12}));
+asm_mat4 view  = asm_mat4_look_at(asm_vec3_load((asm_vec3){0, 0, 5}),
+                                  asm_vec3_load((asm_vec3){0, 0, 0}),
+                                  asm_vec3_load((asm_vec3){0, 1, 0}));
+asm_quat q     = asm_quat_from_axis_angle((asm_vec3){0, 1, 0}, 0.7f);
+asm_simd_vec3 r = asm_quat_rotate_vec3(q, n);
+```
+
+The SIMD abstraction is a portable scalar implementation (the same `asm_simd_*`
+shim used by the original), so the code compiles unchanged everywhere; the
+compiler auto-vectorises the component-wise loops. One deliberate fix: the
+reference `mat4_inverse` returns `-M⁻¹` for rotation/scale matrices, so asmlib
+uses a Gauss–Jordan inverse instead.
 
 ## Design notes
 
@@ -505,6 +628,11 @@ tagging. `make test` also runs the multithreaded stress tests
 run millions of mixed allocate/free/realloc operations with per-block tags,
 hand blocks to each other to free cross-thread, and report any corruption,
 exercising both allocators' locks and the thread-local caches.
+`tests/test_alloc_threads.c` churns 32 short-lived threads and flushes each
+thread's cache on exit. `tests/test_alloc_debug.c` and
+`tests/test_portable_alloc_debug.c` build the allocators with
+`ASMLIB_ALLOC_DEBUG` and fork to prove a double free (and, for the portable
+backend, a misaligned pointer) traps.
 
 `tests/test_format.c` differentially checks every supported `asm_snprintf`
 conversion against the host `snprintf` — byte for byte and by return value —
@@ -520,6 +648,13 @@ integers (all bases, signs, prefixes, overflow, truncation), strings, chars,
 suppression, literals and whitespace, and uses guard pages to prove the source
 is never read past its NUL and that `%s`/`%c` never write past the declared
 width. It runs under `make test`, `test-aarch64`, `test-libc` and `test-asan`.
+
+`tests/test_linalg.c` checks the vector/matrix/quaternion port against
+hand-computed values, a small independent scalar reference and algebraic
+identities: cross/dot/normalisation, `M * M⁻¹ = I` for Mat3 and Mat4,
+perspective/look-at/unproject round-trips, and quaternion rotation agreeing
+with the equivalent matrix. It runs under `make test`, `test-aarch64` and
+`test-asan`.
 
 `make test-math` runs one differential binary per math family
 (`tests/test_math_*.c`). Each compares the implementation against the host
@@ -544,128 +679,29 @@ Three helper targets exercise the same suites under dynamic analysis:
 Both tools found and helped fix issues during development, including a
 harness bug where a string pointer was offset past the terminating NUL.
 
+`make fuzz` builds and runs the libFuzzer targets in `fuzz/` (number
+converters, `asm_snprintf`, `asm_sscanf` and the vector/matrix/quaternion
+math) under AddressSanitizer + UBSan. Each target compares against the host
+libc where the subset matches and checks its invariants otherwise. CI runs a
+short budget on every push; see `ROADMAP.md` for the production punch list.
+
 ## Benchmark
 
-`make bench` reports nanoseconds/call for asmlib vs. glibc and the speedup
-(`> 1.00x` means asmlib is faster). Results are hardware-dependent and noisy;
-on the development machine (Intel Comet Lake, glibc 2.44) `memchr` is
-consistently faster and mid/large `memcpy`, `memset` and `memcmp` are at
-parity, while glibc keeps an edge on `strlen` and on its heavily optimised
-two-way `strstr`. The benchmark makes the trade-offs visible and guards
-against regressions.
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) is the methodology and results page:
+it documents the harnesses, the measurement setup (clocks, iteration counts,
+best-of-N, how builtin substitution is defeated), the environment, and the
+published results for the arena/malloc heap, math, formatting and scanning.
+`make bench` prints the live memory/string comparison against glibc (`> 1.00x`
+means asmlib is faster); `make bench-arena`, `make bench-math`,
+`make bench-format` and `make bench-scan` cover the rest, and `make perfbench`
+drives `perf` attribution.
 
-`make bench-arena` (alias `make bench-alloc`) compares the arena and the
-malloc heap against glibc `malloc`/`free`. Both use only raw `mmap` — there is
-no libc allocator on their side. On the development machine (best of 9 trials,
-ns per operation):
-
-```
-workload                              asm       malloc   speedup
-arena   1000 x 64B                   4.36        37.46     8.59x
-arena   4000 mixed 8..512B           4.35        86.13    19.80x
-arena   1000 x 64B +memset           7.29        43.52     5.97x
-malloc  1000 x 64B                   8.55        40.94     4.79x
-malloc  4000 mixed 8..512B          11.53        93.10     8.08x
-2048 x 1KiB fill+release (us)        22.28      1012.72    45.46x
-```
-
-The arena wins because allocation is a pointer bump, the memory is contiguous
-(cache-predictable), and a reset is one rewind rather than thousands of
-`free` calls. The malloc heap now wins over glibc on burst workloads too: the
-thread-local cache makes the steady-state `malloc`/`free` path a couple of
-instructions, so the global lock only appears on refills and over-budget
-frees. The trade-offs — the arena reclaims in bulk or to a mark and stays
-single-threaded, while the malloc heap takes a lock off the hot path, are the
-usual ones for these designs.
-
-`make bench-math` runs `bench/math_bench.c`, which times every math routine
-against the host `libm` on representative inputs (best of 7, ns/call). On the
-development machine (glibc 2.44):
-
-```
-function         libm     asmlib   speedup
-sqrt             1.75       1.72     1.02x
-cbrt            17.20       7.89     2.18x
-fmod             7.21       7.85     0.92x
-exp              5.23       5.27     0.99x
-exp2             4.28       4.33     0.99x
-expm1            4.48       6.47     0.69x
-log              4.76       5.49     0.87x
-log2             5.14       5.93     0.87x
-pow             15.70      16.71     0.94x
-sin             14.45      17.87     0.81x
-cos             14.09      18.21     0.77x
-tan             17.87      18.13     0.99x
-asin             8.34       9.39     0.89x
-atan2           19.46      19.15     1.02x
-cosh             9.94       7.49     1.33x
-sinh            10.79      20.84     0.52x
-tanh             5.04       7.40     0.68x
-asinh           20.62      14.97     1.38x
-```
-
-`cbrt` is more than twice as fast, `cosh`/`asinh` are ~1.3–1.4x faster, and
-`sqrt`, `exp`, `exp2`, `tan` and `atan2` are near parity. The remaining
-kernels (`sin`, `cos`, `log`, `pow`, `expm1`, `tanh`, `sinh`) sit within
-roughly 0.5–0.9x of glibc's hand-tuned code. Native builds use FMA (implied by
-AVX2) for the kernels that support it; the wasm32 build stays FMA-free and uses
-the portable fallbacks, so the same sources run unchanged there. The earlier
-double-double kernels (which cost 20-60x for `exp`/`pow`/`sinh`) are gone.
-
-`make bench-format` runs `bench/format_bench.c`, which times `asm_snprintf` and
-`asm_u64toa` against the host `snprintf` (best of 9, ns/call). On the
-development machine (glibc 2.44):
-
-```
-workload                     libc     asmlib   speedup
-snprintf "%d"               50.55      28.48     1.78x
-snprintf "%lld"             74.69      41.45     1.80x
-snprintf "%08x"             60.56      28.77     2.10x
-snprintf "[%-16s]"          60.94      29.18     2.09x
-snprintf mixed             159.32     104.35     1.53x
-asm_u64toa (vs %llu)        80.79      20.32     3.98x
-```
-
-The decimal path picks a fixed chunk size from the magnitude and emits
-two/four/eight-digit groups from a 200-byte table using reciprocal multiplies
-(no hardware divide); hex and octal shift and mask. `asm_u64toa` writes
-straight into the caller's buffer when it is provably large enough to hold the
-result, and the formatter appends through a single bounded sink whose small
-copies and fills use overlapping wide moves instead of `rep` startup, so even
-the tiny `"%d"` case beats glibc's much larger `printf` machinery.
-
-`make bench-scan` runs `bench/scan_bench.c`, timing `asm_sscanf` against the
-host `sscanf` (best of 9, ns/call):
-
-```
-workload                     libc     asmlib   speedup
-sscanf "%d"                130.93      44.78     2.92x
-sscanf "%lld"              193.06      63.39     3.05x
-sscanf "%x"                120.55      48.36     2.49x
-sscanf "%15s"               65.96      30.23     2.18x
-sscanf mixed               233.35     105.76     2.21x
-```
-
-libc's scanf machinery is heavier than printf's; the smaller, branch-driven
-scanner is 2.2–3x faster on the integer/string cases it targets.
-
-### Profiling with perf
-
-`make perfbench` builds `bench/perfbench.c`, a harness that runs **one
-operation per invocation** so `perf` attribution is unambiguous:
-
-```sh
-perf record -o /tmp/p.data ./build/perfbench strcmp 100000
-perf report -i /tmp/p.data --no-children --sort=symbol --stdio
-perf stat    -e task-clock,cycles,instructions ./build/perfbench memcpy 100000
-```
-
-That harness drove the latest round of tuning: it showed `strcmp`'s 8-byte
-SWAR loop at 0.69 cycles/byte (4.6x slower than glibc), `memmem` spending 21%
-of its scan in the scalar last-byte check, and `strchr` burning 44% of a
-short scan stepping to alignment. The first two and the third led to the
-AVX2 `strcmp`, the ERMS/NT `memcpy` geometry, and the align-down `strchr`
-respectively.
+Results are hardware-dependent and noisy. On the development machine (Intel
+Comet Lake, glibc 2.44) `memchr` is consistently faster and mid/large `memcpy`,
+`memset` and `memcmp` are at parity, while glibc keeps an edge on `strlen` and
+its two-way `strstr`; the arena beats glibc `malloc`/`free` by roughly 5-20x
+(and ~45x for a bulk reset) and the malloc heap by 5-8x, and `asm_snprintf`,
+`asm_u64toa` and `asm_sscanf` are 1.5-4x faster.
 
 ## Example
 
@@ -733,15 +769,61 @@ energy to ~1e-9 relative, the tip never leaves the 2 m arm reach, and the
 single-precision path stays finite. The same source builds natively (host
 libm) for cross-checking.
 
+### Image-editing WebAssembly demo
+
+`examples/image_edit.c` is a second wasm **library** module that edits RGBA8
+images using the vector/matrix headers (`asm_vec3`/`asm_vec4`, `asm_mat3`) and
+the asmlib math routines. It exports a small C ABI:
+
+| Function | Operation |
+|---|---|
+| `ie_adjust(px, n, brightness, contrast, saturation)` | colour grading with `asm_vec3` |
+| `ie_grayscale(px, n)` / `ie_invert(px, n)` | Rec.709 luma / channel inversion |
+| `ie_convolve3(src, dst, w, h, kernel[9], bias)` | 3×3 kernel held in an `asm_mat3` |
+| `ie_box_blur(src, dst, w, h)` / `ie_sharpen(...)` | ready-made kernels |
+| `ie_warp(src, w, h, dst, ow, oh, m[9])` | affine warp, bilinear via `asm_vec4_lerp` |
+| `ie_rotate(src, w, h, dst, angle)` | rotation about the centre |
+
+Like the pendulum module it is freestanding (no imports) and supplies its own
+math and `malloc`/`free`.
+
+```sh
+make wasm-image         # build build/image_edit.wasm
+make wasm-image-example # node driver: checks every operation
+make wasm-image-serve   # open http://localhost:8000/image_edit.html
+```
+
+`examples/web/image_edit.html` is a self-contained editor (canvas, sliders for
+brightness/contrast/saturation/rotation, grayscale/invert/blur/sharpen/edge
+buttons, PNG download, and image upload) that copies pixels through the module.
+The `make wasm-image-example` driver checks grayscale makes R=G=B, double
+invert is the identity, `adjust(1,1,1)` and the identity kernel/rotation are
+no-ops, blur/sharpen leave a flat image flat, and blur smooths an edge.
+
 ## Freestanding and portability
 
-The string/memory routines and the arena's fixed and callback modes have no
-OS or libc dependency and link under `-nostdlib`. The only platform-specific
-code is the syscall layer (`src/sys.asm` on x86-64, `src/aarch64/sys.S` on
-AArch64); on bare metal or another OS, pass your own `alloc`/`free` to
-`asm_arena_init_grow` and skip `asm_arena_init_mmap` and `asm_malloc`. The
-malloc heap additionally assumes a runtime that has set up the thread pointer
-for its TLS cache, so it is not for `-nostdlib` bare-metal use. The
+The library has exactly one OS boundary: the syscall module (`src/sys.asm` on
+x86-64, `src/aarch64/sys.S` on AArch64). Everything else is freestanding — no
+OS, no libc.
+
+| Layer | OS / libc | Notes |
+|---|---|---|
+| `asm_sys_mmap`/`munmap`/`alloc`/`free` | Linux syscalls | the only platform-specific code |
+| `asm_arena_init_mmap` | Linux syscalls | lives in the sys module, so `arena.asm` stays OS-free |
+| `asm_malloc` heap | Linux syscalls + TLS | needs a runtime that set up the thread pointer |
+| memory / string / comparison / search / ctype | none | link under `-nostdlib` |
+| arena (`asm_arena_init`, `asm_arena_init_grow`) | none | caller memory or caller `alloc`/`free` callbacks; pulls no syscalls |
+| math (`src/math/`) | none | no `errno`, no FP environment, no global state |
+| format / scan | none | |
+| vector / matrix / quaternion | none | header-only on the math routines |
+
+`ASMLIB_OS_HEAP` in `asmlib.h` is 1 on Linux and 0 elsewhere, so callers can
+guard the OS-backed routines. On bare metal or another OS, use
+`asm_arena_init`/`asm_arena_init_grow` and skip the heap, `asm_sys_*` and
+`asm_arena_init_mmap`. `make test-freestanding` links `tests/test_freestanding.c`
+with **`-nostdlib -static`** (its own `_start`, exit by raw syscall) and
+exercises the arena, string/memory/ctype, math, formatters/scanner and linalg —
+the resulting binary contains no `asm_sys_*`/`asm_malloc` symbol at all. The
 test/benchmark harnesses use libc, but the library itself does not.
 
 The math library (`src/math/`) is freestanding by construction: it calls no

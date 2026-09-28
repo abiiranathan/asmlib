@@ -43,8 +43,9 @@ default rel
 
 extern asm_memset
 extern asm_memcpy
-extern asm_sys_alloc
-extern asm_sys_free
+; NOTE: this module is deliberately free of any OS dependency. The mmap-backed
+; initialiser (asm_arena_init_mmap) lives in sys.asm, so linking an arena built
+; on caller memory (asm_arena_init / asm_arena_init_grow) pulls in no syscalls.
 
 ; ---- asm_arena field offsets (must match include/asmlib.h) ------------------
 %define A_PTR       0                   ; unsigned char *ptr - next free byte in the current chunk
@@ -175,29 +176,6 @@ asm_arena_init_grow:
 .bad:
     mov     eax, -1                     ; return -1 (bad arguments)
     ret                                 ; return
-
-;==============================================================================
-; int asm_arena_init_mmap(asm_arena *a, size_t chunk_size)
-;------------------------------------------------------------------------------
-; Growable arena whose chunks come straight from the kernel via anonymous
-; mmap. No libc, no caller-supplied allocator. Requires Linux x86-64.
-;
-; Parameters (System V AMD64 ABI):
-;   rdi = a (asm_arena *)  - arena to initialise
-;   rsi = chunk_size (size_t)  - default chunk size, clamped up to 4096
-; Returns:
-;   rax = 0 on success, -1 if a is NULL
-; Uses / clobbers:
-;   Reads rdi, rsi; writes rax, rcx, rdx, r8, r9; tail-calls asm_arena_init_grow.
-;==============================================================================
-global asm_arena_init_mmap:function
-asm_arena_init_mmap:
-    ; ---- wire up the anonymous-mmap backend ----
-    mov     r8, rsi                     ; chunk_size
-    xor     ecx, ecx                    ; ctx = NULL
-    lea     rsi, [rel asm_sys_alloc]    ; alloc callback
-    lea     rdx, [rel asm_sys_free]     ; free callback
-    jmp     asm_arena_init_grow         ; tail-call the growable initialiser
 
 ;==============================================================================
 ; internal: L_arena_grow(asm_arena *a, size_t need, size_t align) -> chunk data

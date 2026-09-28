@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<!--
+  image_edit.html - browser UI for the wasm image-editing module.
+
+  Drives the asmlib wasm library (examples/image_edit.c): the RGBA buffer is
+  copied into linear memory, an ie_* routine runs the vec/matrix math, and the
+  result is drawn back. Serve over HTTP (browsers block wasm fetch from
+  file://):
+
+      make wasm-image-serve      # then open http://localhost:8000/image_edit.html
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>asmlib wasm image editor</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
+         background: #14161a; color: #e8ecf1; }
+  header { padding: 14px 18px; border-bottom: 1px solid #2a2f37; }
+  h1 { font-size: 16px; margin: 0 0 2px; font-weight: 650; }
+  header small { color: #8b95a3; }
+  main { display: flex; flex-wrap: wrap; gap: 18px; padding: 18px; align-items: flex-start; }
+  .panel { background: #1b1f26; border: 1px solid #2a2f37; border-radius: 10px; padding: 14px; }
+  .controls { width: 280px; display: flex; flex-direction: column; gap: 12px; }
+  label { display: block; font-size: 12px; color: #9aa5b1; margin-bottom: 4px; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { background: #2b323c; color: #e8ecf1; border: 1px solid #3a424e;
+           border-radius: 7px; padding: 7px 11px; cursor: pointer; font: inherit; }
+  button:hover { background: #343d49; }
+  button.primary { background: #2f6fed; border-color: #2f6fed; }
+  canvas { background: repeating-conic-gradient(#20242b 0% 25%, #262b33 0% 50%) 50%/22px 22px;
+           border: 1px solid #2a2f37; border-radius: 10px; max-width: 100%; }
+  .hint { color: #f0b429; font-size: 12px; }
+  input[type=file] { color: #9aa5b1; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>asmlib wasm image editor</h1>
+  <small>vec / matrix / quaternion math compiled to WebAssembly, no imports</small>
+</header>
+<main>
+  <div class="panel controls">
+    <div>
+      <label>Brightness <span id="vB">1.00</span></label>
+      <input id="brightness" type="range" min="0.2" max="2" step="0.01" value="1">
+    </div>
+    <div>
+      <label>Contrast <span id="vC">1.00</span></label>
+      <input id="contrast" type="range" min="0.2" max="2" step="0.01" value="1">
+    </div>
+    <div>
+      <label>Saturation <span id="vS">1.00</span></label>
+      <input id="saturation" type="range" min="0" max="2" step="0.01" value="1">
+    </div>
+    <div>
+      <label>Rotate <span id="vR">0&deg;</span></label>
+      <input id="rotate" type="range" min="-180" max="180" step="1" value="0">
+    </div>
+    <div class="row">
+      <button id="gray">Grayscale</button>
+      <button id="invert">Invert</button>
+      <button id="blur">Blur</button>
+      <button id="sharpen">Sharpen</button>
+      <button id="edge">Edge</button>
+    </div>
+    <div class="row">
+      <button id="reset">Reset</button>
+      <button id="download" class="primary">Download PNG</button>
+    </div>
+    <div>
+      <label>Load an image</label>
+      <input id="file" type="file" accept="image/*">
+    </div>
+    <div id="status" class="hint"></div>
+  </div>
+  <canvas id="view" width="480" height="360"></canvas>
+</main>
+
+<script>
+'use strict';
+
+const MAX = 480;                     // largest edge we process (keeps it snappy)
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+let ex = null;                       // wasm exports
+let srcPtr = 0, dstPtr = 0, kernPtr = 0, capBytes = 0;
+let W = 0, H = 0, NPX = 0;
+let base = null;                     // original ImageData
+let current = null;                  // displayed ImageData
+
+const mem = () => new Uint8Array(ex.memory.buffer);
+
+function fail(msg) { statusEl.className = 'hint'; statusEl.textContent = msg; }
+
+function ensureCap(w, h) {
+  const need = w * h * 4;
+  if (need > capBytes) {
+    if (srcPtr) ex.free(srcPtr);
+    if (dstPtr) ex.free(dstPtr);
+    srcPtr = ex.malloc(need);
+    dstPtr = ex.malloc(need);
+    if (!srcPtr || !dstPtr) throw new Error('wasm alloc failed');
+    capBytes = need;
+  }
+  W = w; H = h; NPX = w * h;
+}
+
+function upload(img) { mem().set(img.data, srcPtr); }
+function output() { return new Uint8ClampedArray(mem().buffer, dstPtr, NPX * 4).slice(); }
+function readSrc() { return new Uint8ClampedArray(mem().buffer, srcPtr, NPX * 4).slice(); }
+
+function draw(img) {
+  canvas.width = W; canvas.height = H;
+  ctx.putImageData(img, 0, 0);
+}
+
+/* ---- operations -------------------------------------------------------- */
+function applyAdjust() {
+  const b = +document.getElementById('brightness').value;
+  const c = +document.getElementById('contrast').value;
+  const s = +document.getElementById('saturation').value;
+  if (!base) return;
+  const img = new ImageData(new Uint8ClampedArray(base.data), base.width, base.height);
+  upload(img);
+  ex.ie_adjust(srcPtr, NPX, b, c, s);
+  current = new ImageData(readSrc(), W, H);
+  draw(current);
+}
+function inPlace(fn) {
+  if (!current) return;
+  const img = new ImageData(new Uint8ClampedArray(current.data), W, H);
+  upload(img);
+  fn();
+  current = new ImageData(readSrc(), W, H);
+  draw(current);
+}
+function filter(fn) {
+  if (!current) return;
+  upload(current);
+  fn();
+  current = new ImageData(output(), W, H);
+  draw(current);
+}
+function rotate() {
+  if (!current) return;
+  const deg = +document.getElementById('rotate').value;
+  upload(current);
+  ex.ie_rotate(srcPtr, W, H, dstPtr, deg * Math.PI / 180);
+  current = new ImageData(output(), W, H);
+  draw(current);
+}
+function edge() {
+  if (!current) return;
+  const k = [-1, -1, -1, -1, 8, -1, -1, -1, -1];
+  new Float32Array(ex.memory.buffer, kernPtr, 9).set(k);
+  upload(current);
+  ex.ie_convolve3(srcPtr, dstPtr, W, H, kernPtr, 0);
+  current = new ImageData(output(), W, H);
+  draw(current);
+}
+
+/* ---- image loading ----------------------------------------------------- */
+function loadImage(source) {
+  const img = new Image();
+  img.onload = () => {
+    const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const off = document.createElement('canvas');
+    off.width = w; off.height = h;
+    off.getContext('2d').drawImage(img, 0, 0, w, h);
+    ensureCap(w, h);
+    base = off.getContext('2d').getImageData(0, 0, w, h);
+    current = new ImageData(new Uint8ClampedArray(base.data), w, h);
+    document.getElementById('rotate').value = 0;
+    document.getElementById('vR').innerHTML = '0&deg;';
+    resetSliders();
+    draw(current);
+    statusEl.textContent = '';
+  };
+  img.onerror = () => fail('could not load that image');
+  img.src = source;
+}
+
+/* A simple procedural test image so the page works without a file. */
+function defaultImage() {
+  const w = 360, h = 270;
+  ensureCap(w, h);
+  base = new ImageData(w, h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      base.data[i] = (x * 255 / w) | 0;
+      base.data[i + 1] = (y * 255 / h) | 0;
+      base.data[i + 2] = ((x + y) * 255 / (w + h)) | 0;
+      base.data[i + 3] = 255;
+    }
+  /* a few solid shapes */
+  const put = (cx, cy, r, col) => {
+    for (let y = cy - r; y <= cy + r; y++)
+      for (let x = cx - r; x <= cx + r; x++) {
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        if ((x - cx) ** 2 + (y - cy) ** 2 > r * r) continue;
+        const i = (y * w + x) * 4;
+        base.data[i] = col[0]; base.data[i + 1] = col[1]; base.data[i + 2] = col[2];
+      }
+  };
+  put(90, 80, 42, [255, 255, 255]);
+  put(250, 90, 34, [240, 80, 80]);
+  put(170, 190, 50, [80, 200, 120]);
+  current = new ImageData(new Uint8ClampedArray(base.data), w, h);
+  draw(current);
+}
+
+function resetSliders() {
+  document.getElementById('brightness').value = 1;
+  document.getElementById('contrast').value = 1;
+  document.getElementById('saturation').value = 1;
+  document.getElementById('vB').textContent = '1.00';
+  document.getElementById('vC').textContent = '1.00';
+  document.getElementById('vS').textContent = '1.00';
+  document.getElementById('rotate').value = 0;
+  document.getElementById('vR').innerHTML = '0&deg;';
+}
+
+/* ---- wire up ----------------------------------------------------------- */
+function bind() {
+  document.getElementById('brightness').oninput = (e) => { document.getElementById('vB').textContent = (+e.target.value).toFixed(2); applyAdjust(); };
+  document.getElementById('contrast').oninput = (e) => { document.getElementById('vC').textContent = (+e.target.value).toFixed(2); applyAdjust(); };
+  document.getElementById('saturation').oninput = (e) => { document.getElementById('vS').textContent = (+e.target.value).toFixed(2); applyAdjust(); };
+  document.getElementById('rotate').oninput = (e) => { document.getElementById('vR').innerHTML = e.target.value + '&deg;'; };
+  document.getElementById('rotate').onchange = rotate;
+
+  document.getElementById('gray').onclick = () => inPlace(() => ex.ie_grayscale(srcPtr, NPX));
+  document.getElementById('invert').onclick = () => inPlace(() => ex.ie_invert(srcPtr, NPX));
+  document.getElementById('blur').onclick = () => filter(() => ex.ie_box_blur(srcPtr, dstPtr, W, H));
+  document.getElementById('sharpen').onclick = () => filter(() => ex.ie_sharpen(srcPtr, dstPtr, W, H));
+  document.getElementById('edge').onclick = edge;
+  document.getElementById('reset').onclick = () => {
+    current = new ImageData(new Uint8ClampedArray(base.data), W, H);
+    resetSliders();
+    draw(current);
+  };
+  document.getElementById('download').onclick = () => {
+    const a = document.createElement('a');
+    a.download = 'asmlib-edited.png';
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  };
+  document.getElementById('file').onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) loadImage(URL.createObjectURL(f));
+  };
+}
+
+(async () => {
+  try {
+    let instance;
+    try {
+      ({ instance } = await WebAssembly.instantiateStreaming(fetch('image_edit.wasm'), {}));
+    } catch (e) {
+      const buf = await (await fetch('image_edit.wasm')).arrayBuffer();
+      ({ instance } = await WebAssembly.instantiate(buf, {}));
+    }
+    ex = instance.exports;
+    kernPtr = ex.malloc(9 * 4);
+    defaultImage();
+    bind();
+  } catch (err) {
+    fail('could not load image_edit.wasm — serve over HTTP (make wasm-image-serve): ' + err.message);
+  }
+})();
+</script>
+</body>
+</html>
