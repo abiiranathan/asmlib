@@ -30,6 +30,7 @@
 #define ASMLIB_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -182,6 +183,60 @@ int asm_iscntrl(int c);  /* 0x00..0x1F or 0x7F                      */
 int asm_isgraph(int c);  /* 0x21..0x7E                              */
 int asm_ispunct(int c);  /* printable, non-alphanumeric             */
 int asm_isblank(int c);  /* space or horizontal tab                 */
+
+/*==============================================================================
+ * Integer formatting (format.asm)
+ *------------------------------------------------------------------------------
+ * Bounded, NUL-terminating integer-to-string helpers. Each writes digits to
+ * buf, then a NUL when cap > 0, and never writes more than cap bytes. The
+ * return value is the number of characters the *full* representation needs,
+ * excluding the NUL, so ret >= cap means the output was truncated. With
+ * cap == 0 nothing is written and only the length is returned.
+ *
+ * Digits are written most-significant first. `base` must be 2..36 and uses
+ * 0-9 then a-z. Buffers must be large enough for the untruncated result if you
+ * care about the complete string; a 21-byte buffer covers any uint64_t in
+ * decimal, 65 bytes covers binary.
+ *============================================================================*/
+
+/* Unsigned decimal. */
+size_t asm_u64toa(uint64_t value, char* buf, size_t cap);
+
+/* Signed decimal; emits a leading '-' for negative values (INT64_MIN is fine). */
+size_t asm_i64toa(int64_t value, char* buf, size_t cap);
+
+/* Unsigned in base 2..36 (lowercase letters). Returns 0 for a bad base. */
+size_t asm_u64toa_base(uint64_t value, char* buf, size_t cap, unsigned base);
+
+/* Unsigned hexadecimal without a "0x" prefix; uppercase when `uppercase`. */
+size_t asm_u64tohex(uint64_t value, char* buf, size_t cap, int uppercase);
+
+/*==============================================================================
+ * Minimal snprintf (format.asm)
+ *------------------------------------------------------------------------------
+ * `int asm_snprintf(char* dst, size_t size, const char* fmt, ...)`
+ *
+ * A small, fast, freestanding replacement for the common integer/string cases
+ * of snprintf. Semantics match C99 snprintf: at most size-1 bytes are written,
+ * a NUL is stored when size > 0, and the return value is the number of bytes
+ * that *would* have been written excluding the NUL (negative is never
+ * returned). Not floating point, not locale aware, not async-signal-safe.
+ *
+ * Supported conversions (an argument is consumed for each):
+ *   %%  literal percent          %c  int -> one byte
+ *   %s  char* (NULL -> "(null)")  %p  void* -> "0x" + lowercase hex, NULL -> "(nil)"
+ *   %d  %i  signed decimal (int, or int64 with an l/ll length modifier)
+ *   %u      unsigned decimal      %x %X  hexadecimal (lower/upper)
+ *   %o      octal
+ * Flags:   '-' left-justify, '0' zero-pad (numeric conversions; ignored for
+ *          %s/%c and with '-'). Width: decimal digits only, no '*'.
+ * Length:  'l' and 'll' both mean 64-bit for d/i/u/x/X/o; no h/z/j/t/L.
+ * Anything else after '%' (including precision '.', '*', and %f/%e/%g/%a/%n)
+ * is copied through literally as '%' plus that character and consumes no
+ * argument. Widths above 2^31-1 are clamped.
+ *============================================================================*/
+
+int asm_snprintf(char* dst, size_t size, const char* fmt, ...);
 
 /*==============================================================================
  * Arena allocator (arena.asm)

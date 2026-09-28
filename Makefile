@@ -45,19 +45,21 @@ WASM_CC     ?= clang --target=wasm32-unknown-unknown
 LIBC_SRC      := $(wildcard src/libc/*.c)
 LIBC_CFLAGS   := -O2 -std=c11 -ffreestanding -fno-builtin -fno-stack-protector \
                  -Wall -Wextra -Isrc/libc
-LIBC_TEST_BIN := $(BUILD)/test_portable $(BUILD)/test_portable_alloc
+LIBC_TEST_BIN := $(BUILD)/test_portable $(BUILD)/test_portable_alloc $(BUILD)/test_portable_format
 
 TEST_BIN      := $(BUILD)/test_asmlib
 TEST_ARENA_BIN:= $(BUILD)/test_arena
 TEST_ALLOC_BIN:= $(BUILD)/test_alloc
+TEST_FORMAT_BIN := $(BUILD)/test_format
 TEST_MT_BIN   := $(BUILD)/test_alloc_mt $(BUILD)/test_portable_alloc_mt
 BENCH_BIN     := $(BUILD)/bench
 BENCH_ARENA_BIN := $(BUILD)/bench_arena
 MATH_BENCH_BIN  := $(BUILD)/math_bench
+FORMAT_BENCH_BIN := $(BUILD)/format_bench
 PERF_BIN      := $(BUILD)/perfbench
 EX_BIN        := $(BUILD)/example
 
-.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math perfbench example clean wasm wasm-lib wasm-example wasm-serve test-aarch64 aarch64
+.PHONY: all test test-valgrind test-asan test-math test-libc test-mt bench bench-arena bench-alloc bench-math bench-format perfbench example clean wasm wasm-lib wasm-example wasm-serve test-aarch64 aarch64
 
 all: $(STATIC) $(SHARED)
 
@@ -85,6 +87,9 @@ $(TEST_ARENA_BIN): tests/test_arena.c $(STATIC) $(HEADER)
 $(TEST_ALLOC_BIN): tests/test_alloc.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ tests/test_alloc.c $(STATIC) $(LDFLAGS)
 
+$(TEST_FORMAT_BIN): tests/test_format.c $(STATIC) $(HEADER)
+	$(CC) $(CFLAGS) -o $@ tests/test_format.c $(STATIC) $(LDFLAGS)
+
 # Multithreaded allocator stress tests (native asm heap and portable heap).
 $(BUILD)/test_alloc_mt: tests/test_alloc_mt.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -pthread -o $@ tests/test_alloc_mt.c $(STATIC) $(LDFLAGS)
@@ -92,10 +97,11 @@ $(BUILD)/test_alloc_mt: tests/test_alloc_mt.c $(STATIC) $(HEADER)
 $(BUILD)/test_portable_alloc_mt: tests/test_portable_alloc_mt.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -pthread -o $@ tests/test_portable_alloc_mt.c src/libc/alloc.c
 
-test: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN) $(TEST_MT_BIN)
+test: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN) $(TEST_FORMAT_BIN) $(TEST_MT_BIN)
 	./$(TEST_BIN)
 	./$(TEST_ARENA_BIN)
 	./$(TEST_ALLOC_BIN)
+	./$(TEST_FORMAT_BIN)
 	./$(BUILD)/test_alloc_mt
 	./$(BUILD)/test_portable_alloc_mt
 
@@ -115,13 +121,15 @@ test-valgrind: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN)
 		--errors-for-leak-kinds=definite --undef-value-errors=no ./$(TEST_ALLOC_BIN)
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
-test-asan: tests/test_asmlib.c tests/test_arena.c tests/test_alloc.c $(STATIC) $(HEADER)
+test-asan: tests/test_asmlib.c tests/test_arena.c tests/test_alloc.c tests/test_format.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_asan tests/test_asmlib.c $(STATIC)
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_asan
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_arena_asan tests/test_arena.c $(STATIC)
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_arena_asan
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_alloc_asan tests/test_alloc.c $(STATIC)
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_alloc_asan
+	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_format_asan tests/test_format.c $(STATIC)
+	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_format_asan
 
 # ---- benchmark --------------------------------------------------------------
 $(BENCH_BIN): bench/bench.c $(STATIC) $(HEADER)
@@ -146,6 +154,12 @@ $(MATH_BENCH_BIN): bench/math_bench.c $(MATH_OBJ) include/asmlib_math.h | $(BUIL
 
 bench-math: $(MATH_BENCH_BIN)
 	./$(MATH_BENCH_BIN)
+
+$(FORMAT_BENCH_BIN): bench/format_bench.c $(STATIC) $(HEADER)
+	$(CC) $(CFLAGS) -o $@ bench/format_bench.c $(STATIC) $(LDFLAGS)
+
+bench-format: $(FORMAT_BENCH_BIN)
+	./$(FORMAT_BENCH_BIN)
 
 # One-phase-per-invocation harness for profiling with `perf`:
 #   perf record -o /tmp/p.data ./build/perfbench <phase> [reps]
@@ -185,6 +199,9 @@ $(BUILD)/test_portable: tests/test_portable.c src/libc/mem.c src/libc/str.c src/
 
 $(BUILD)/test_portable_alloc: tests/test_portable_alloc.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -o $@ tests/test_portable_alloc.c src/libc/alloc.c
+
+$(BUILD)/test_portable_format: tests/test_format.c src/libc/format.c src/libc/portable.h include/asmlib.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_format.c src/libc/format.c
 
 test-libc: $(LIBC_TEST_BIN)
 	@for t in $(LIBC_TEST_BIN); do ./$$t || exit 1; done
@@ -267,13 +284,17 @@ $(BUILD)/aarch64_test_arena: tests/test_arena.c $(A64_STATIC) $(HEADER) | $(BUIL
 $(BUILD)/aarch64_test_alloc: tests/test_alloc.c $(A64_STATIC) $(HEADER) | $(BUILD)
 	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_alloc.c $(A64_STATIC)
 
+$(BUILD)/aarch64_test_format: tests/test_format.c $(A64_STATIC) $(HEADER) | $(BUILD)
+	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_format.c $(A64_STATIC)
+
 aarch64: $(A64_STATIC)
 	@echo "built $(A64_STATIC)"
 
-test-aarch64: aarch64 $(BUILD)/aarch64_test_asmlib $(BUILD)/aarch64_test_arena $(BUILD)/aarch64_test_alloc
+test-aarch64: aarch64 $(BUILD)/aarch64_test_asmlib $(BUILD)/aarch64_test_arena $(BUILD)/aarch64_test_alloc $(BUILD)/aarch64_test_format
 	$(A64_QEMU) $(BUILD)/aarch64_test_asmlib
 	$(A64_QEMU) $(BUILD)/aarch64_test_arena
 	$(A64_QEMU) $(BUILD)/aarch64_test_alloc
+	$(A64_QEMU) $(BUILD)/aarch64_test_format
 
 clean:
 	rm -rf $(BUILD)

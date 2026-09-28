@@ -67,4 +67,13 @@ size_t ASM_LIBC(malloc_usable_size)(void *ptr);
 int    ASM_LIBC(posix_memalign)(void **memptr, size_t alignment, size_t size);
 void  *ASM_LIBC(aligned_alloc)(size_t alignment, size_t size);
 
+/* ---- formatting -------------------------------------------------------- */
+/* Bounded integer-to-string converters (always asm_-prefixed) and the minimal
+ * snprintf. See include/asmlib.h for the supported format subset. */
+size_t asm_u64toa(unsigned long long value, char *buf, size_t cap);
+size_t asm_i64toa(long long value, char *buf, size_t cap);
+size_t asm_u64toa_base(unsigned long long value, char *buf, size_t cap, unsigned base);
+size_t asm_u64tohex(unsigned long long value, char *buf, size_t cap, int uppercase);
+int    ASM_LIBC(snprintf)(char *dst, size_t size, const char *fmt, ...);
+
 #endif /* ASMLIB_PORTABLE_H */

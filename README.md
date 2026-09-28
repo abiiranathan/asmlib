@@ -12,13 +12,13 @@ compiler and linker), thoroughly tested against libc, and packaged with a C
 header plus static and shared libraries.
 
 ```
-src/        NASM sources (one module per area)
+src/        NASM sources (memory, string, comparison, search, ctype, alloc, format)
 src/aarch64/ hand-written AArch64 assembly port (same API, NEON)
 src/math/   freestanding C math library (no libc; builds for wasm32)
-src/libc/   portable C memory/string/allocator backend for wasm/freestanding
+src/libc/   portable C memory/string/allocator/format backend for wasm/freestanding
 include/    asmlib.h — the public C API; asmlib_math.h — the math API
-tests/      differential + page-boundary + arena + malloc + math + portable suites
-bench/      asmlib vs. libc micro-benchmarks, arena/malloc vs. malloc
+tests/      differential + page-boundary + arena + malloc + format + math + portable suites
+bench/      asmlib vs. libc micro-benchmarks (routines, allocators, formatting)
 examples/   word-frequency analyser and the wasm double-pendulum demo
 ```
 
@@ -31,14 +31,16 @@ examples/   word-frequency analyser and the wasm double-pendulum demo
 | WebAssembly (wasm32) | `src/libc/` + `src/math/` — portable C | `clang --target=wasm32-unknown-unknown`, `wasm-ld` |
 | other freestanding | `src/libc/` + `src/math/` — portable C | any C11 compiler |
 
-The x86-64 and AArch64 backends expose the identical `asm_*` API (71 symbols
+The x86-64 and AArch64 backends expose the identical `asm_*` API (76 routines
 each) and are validated by the same differential suites; WebAssembly and other
-freestanding targets get the memory/string/allocator API plus the math library.
+freestanding targets get the memory/string/allocator/format API plus the math
+library.
 
 ## Highlights
 
-* **Memory, string, comparison, search, ctype, an arena allocator and a
-  malloc-style heap** — 71 routines in all, no libc dependency anywhere.
+* **Memory, string, comparison, search, ctype, an arena allocator, a
+  malloc-style heap and formatting helpers** — 76 routines in all, no libc
+  dependency anywhere.
 * **SIMD where it wins.** 32-byte AVX2/BMI scans (`vpsubb`, `vpminub`,
   `tzcnt`/`bsr`) on x86-64 and NEON (`cmeq`/`umaxv`, `ldp`/`stp`) on AArch64,
   both with branchless ASCII case folding.
@@ -50,6 +52,10 @@ freestanding targets get the memory/string/allocator API plus the math library.
   exist for, and 30–45x faster for a bulk reset of thousands of blocks.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
   `mmap`; roughly 5–8x faster than glibc's allocator for burst workloads.
+* **Fast formatting.** Bounded `asm_u64toa`/`asm_i64toa`/`asm_u64tohex`
+  converters and `asm_snprintf` — a small snprintf (`%d %i %u %x %X %o %c %s
+  %p %%` with width, `-`/`0` flags and `l`/`ll`) that is 1.3–2.6x faster than
+  glibc's for the common cases, with no floating point or locale.
 * **Freestanding math library** for WebAssembly and bare-metal targets: 112
   double- and single-precision routines (`sin`/`sinf`, `log`/`logf`,
   `pow`/`powf`, `cbrt`, `erf`, …) in portable C with no libc, no `libm`, no
@@ -97,6 +103,7 @@ make test-valgrind  # run it under valgrind memcheck (OOB + leak checks)
 make bench      # run the string/memory benchmark vs. libc
 make bench-arena    # arena and asm_malloc vs. libc malloc (same binary)
 make bench-alloc    # alias for bench-arena
+make bench-format   # asm_snprintf / asm_u64toa vs. libc snprintf
 make example    # run the word-frequency example
 make test-math  # run the freestanding double-precision math differential tests
 make test-libc  # run the portable (wasm) memory/string/allocator tests
@@ -177,6 +184,43 @@ Predicates return `1` for true and `0` for false.
 
 ### CPU (`cpu.asm`)
 `unsigned asm_cpu_features(void)` and `int asm_cpu_has_avx2(void)`.
+
+### Formatting (`format.asm`)
+
+Bounded integer-to-string converters plus a small, fast snprintf. All are
+freestanding (no libc) and implemented for x86-64, AArch64 and the portable C
+backend.
+
+| Function | Purpose |
+|---|---|
+| `asm_u64toa(value, buf, cap)` | unsigned decimal |
+| `asm_i64toa(value, buf, cap)` | signed decimal (`-` for negatives) |
+| `asm_u64toa_base(value, buf, cap, base)` | base 2..36, lowercase |
+| `asm_u64tohex(value, buf, cap, uppercase)` | hexadecimal, no `0x` |
+| `asm_snprintf(dst, size, fmt, ...)` | minimal snprintf |
+
+Each converter writes at most `cap` bytes (including a NUL when `cap > 0`) and
+returns the length the full representation needs, so `ret >= cap` flags
+truncation; `cap == 0` writes nothing and returns only the length.
+
+`asm_snprintf` follows C99 snprintf's return value and bounds. It supports
+`%%`, `%c`, `%s` (NULL prints `(null)`), `%p` (`0x` + lowercase hex, NULL prints
+`(nil)`), `%d`/`%i`, `%u`, `%x`/`%X` and `%o`, with the `-` (left) and `0`
+(zero-pad) flags, a decimal width, and the `l`/`ll` length modifiers for 64-bit
+integers. Anything else after `%` is copied through literally and consumes no
+argument. There is deliberately **no** floating point, precision, `*`, locale or
+`%n`.
+
+```c
+#include "asmlib.h"
+
+char buf[32];
+asm_u64toa(18446744073709551615ULL, buf, sizeof buf);   /* "18446744073709551615" */
+asm_i64toa(-42, buf, sizeof buf);                       /* "-42" */
+asm_u64tohex(0xdeadbeef, buf, sizeof buf, 1);           /* "DEADBEEF" */
+asm_snprintf(buf, sizeof buf, "id=%05d n=%-8s x=0x%08x", 7, "bob", 0xabc);
+/* "id=00007 n=bob      x=0x00000abc" */
+```
 
 ### Arena allocator (`arena.asm`)
 
@@ -432,6 +476,14 @@ run millions of mixed allocate/free/realloc operations with per-block tags,
 hand blocks to each other to free cross-thread, and report any corruption,
 exercising both allocators' locks and the thread-local caches.
 
+`tests/test_format.c` differentially checks every supported `asm_snprintf`
+conversion against the host `snprintf` — byte for byte and by return value —
+across values, flags, widths, length modifiers and buffer sizes (including
+truncation and `size == 0`), exercises the converters against a hand-written
+reference and 50,000 random 64-bit values, and places buffers against a
+`PROT_NONE` guard page to prove the writes never exceed `cap`. The same source
+also validates the portable C backend via `make test-libc`.
+
 `make test-math` runs one differential binary per math family
 (`tests/test_math_*.c`). Each compares the implementation against the host
 `libm` over a table of IEEE-754 special values and up to a million randomised
@@ -522,6 +574,25 @@ roughly 0.5–0.9x of glibc's hand-tuned code. Native builds use FMA (implied by
 AVX2) for the kernels that support it; the wasm32 build stays FMA-free and uses
 the portable fallbacks, so the same sources run unchanged there. The earlier
 double-double kernels (which cost 20-60x for `exp`/`pow`/`sinh`) are gone.
+
+`make bench-format` runs `bench/format_bench.c`, which times `asm_snprintf` and
+`asm_u64toa` against the host `snprintf` (best of 9, ns/call). On the
+development machine (glibc 2.44):
+
+```
+workload                     libc     asmlib   speedup
+snprintf "%d"               41.07      30.53     1.35x
+snprintf "%lld"             68.60      40.24     1.70x
+snprintf "%08x"             57.63      34.66     1.66x
+snprintf "[%-16s]"          56.94      44.62     1.28x
+snprintf mixed             144.81     134.01     1.08x
+asm_u64toa (vs %llu)        71.28      27.16     2.62x
+```
+
+The decimal path divides two digits at a time with a reciprocal multiply
+(no hardware divide), hex/octal shift and mask, and the formatter appends
+through a single bounded sink, so even the tiny `"%d"` case beats glibc's much
+larger `printf` machinery.
 
 ### Profiling with perf
 
@@ -623,29 +694,30 @@ libc or `libm`, sets no `errno`, uses no floating-point environment and keeps
 no global state, so a `wasm32` build (or any freestanding target) links with
 nothing.
 
-`src/libc/` is a portable C implementation of the same memory, string and
-allocator API (`memcpy`, `strlen`, `strlcpy`, `malloc`, `posix_memalign`, …)
-for targets where the assembly backends do not run. It is freestanding (no
-libc) and its allocator serves a first-fit free list from `__heap_base`,
-growing WebAssembly linear memory with `memory.grow` on demand (a fixed static
-pool is used in the native tests). The portable allocator is also thread-safe
-(C11 atomics; a no-op lock on wasm builds without threads). `make test-libc`
-differentially tests it against the host libc, including a guard-page suite;
-`make wasm` links it together with the math library into `build/asmlib.wasm`, a
-**complete freestanding libc-subset + libm** module with no imports. The arena
-allocator is not available on wasm yet (only the assembly backends implement
-it); the portable `malloc` is the wasm allocator.
+`src/libc/` is a portable C implementation of the same memory, string,
+allocator and formatting API (`memcpy`, `strlen`, `strlcpy`, `malloc`,
+`asm_u64toa`, `snprintf`, …) for targets where the assembly backends do not
+run. It is freestanding (no libc) and its allocator serves a first-fit free
+list from `__heap_base`, growing WebAssembly linear memory with `memory.grow`
+on demand (a fixed static pool is used in the native tests). The portable
+allocator is also thread-safe (C11 atomics; a no-op lock on wasm builds without
+threads). `make test-libc` differentially tests it against the host libc,
+including a guard-page suite; `make wasm` links it together with the math
+library into `build/asmlib.wasm`, a **complete freestanding libc-subset + libm**
+module with no imports. The arena allocator is not available on wasm yet (only
+the assembly backends implement it); the portable `malloc` is the wasm
+allocator.
 
 ## AArch64 port
 
 The API in `include/asmlib.h` is architecture-neutral, and the library now has
 a hand-written **AArch64** implementation in `src/aarch64/` (GNU assembly, NEON)
-covering the whole string/memory/search/ctype/arena/malloc surface — the same
-`asm_*` symbols as the x86-64 NASM build:
+covering the whole string/memory/search/ctype/arena/malloc/format surface — the
+same `asm_*` symbols as the x86-64 NASM build:
 
 ```
 src/aarch64/  common_aarch64.inc  sys.S  memory.S  string.S  strcmp.S
-              search.S  ctype.S  cpu.S  arena.S  alloc.S
+              search.S  ctype.S  cpu.S  arena.S  alloc.S  format.S
 ```
 
 It follows AAPCS64 (arguments `x0..x7`, callee-saved `x19..x29`, 16-byte stack)
