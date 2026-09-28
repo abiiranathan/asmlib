@@ -32,13 +32,26 @@
  *   backing block with room for the alignment slack, then stamping an indirect
  *   header in front of the aligned payload.
  *
- * The heap is thread-safe via a single global spinlock (malloc_lock) that
- * serialises every free-list and header update, so concurrent callers can share
- * one address space. The lock is a simple acquire/release spinlock built from
- * `ldaxr`/`stxr`, with `wfe` as the contention hint. It is not async-signal-
- * safe: do not call these routines from a signal handler that may interrupt an
- * allocation on the same thread. Small-run memory is never returned to the
- * kernel (like a slab); large blocks are.
+ * Thread safety
+ * -------------
+ * Each thread keeps a small thread-local cache (tcache) of freed small blocks:
+ * malloc pops from it and free pushes to it without taking malloc_lock, so the
+ * uncontended common case stays a few instructions. The global spinlock then
+ * only guards run refills, over-budget frees, large mappings and the aligned
+ * machinery. The cache is bounded by a per-thread byte budget (TCACHE_BUDGET)
+ * so memory cannot be retained without limit. The trade-off is that blocks
+ * still parked in a thread's cache when that thread exits are not reclaimed:
+ * flushing them would need a pthread/libc thread-exit hook, which this library
+ * deliberately does not depend on.
+ *
+ * The cache lives in ELF local-exec TLS. The aarch64 build is static, so the
+ * linker resolves the thread-pointer offsets directly; the runtime must have set
+ * the thread pointer up (the malloc heap already targets Linux). The lock is a
+ * simple acquire/release spinlock built from `ldaxr`/`stxr`, with `wfe` as the
+ * contention hint. It is not async-signal-safe: do not call these routines from
+ * a signal handler that may interrupt an allocation on the same thread.
+ * Small-run memory is never returned to the kernel (like a slab); large blocks
+ * are.
  *
  * AAPCS64 notes: arguments arrive in x0..x7 and the result leaves in x0;
  * x19..x28 are callee-saved and x30 (lr) is saved across any call. Registers
@@ -53,6 +66,9 @@
 #define NUM_CLASSES     512             /* free-list slots (max class index 256)  */
 #define INDIRECT        (-2)            /* aligned/indirect block marker          */
 #define SIZE_MAX        (-1)            /* largest representable size_t           */
+#define TC_CLASSES      (SMALL_TOTAL_MAX / HDR + 1) /* tcache bins (classes 0..256) */
+#define TC_BYTES_OFF    (TC_CLASSES * 8) /* byte counter in the TLS block          */
+#define TCACHE_BUDGET   (1024 * 1024)   /* cached payload bytes per thread        */
 
     .bss
     .align 6
@@ -65,6 +81,17 @@ malloc_freelist:
 malloc_lock:
     .skip 4                             /* global spinlock: 0 = free, 1 = held    */
     .size malloc_lock, 4
+
+/* Per-thread small-block cache (initial-exec/local-exec TLS, zero-filled by the
+ * loader: one LIFO head per small size class followed by the byte counter). */
+    .section .tbss,"awT",%nobits
+    .align 6
+    .globl asm_tcache
+    .type asm_tcache, %tls_object
+asm_tcache:
+    .skip TC_CLASSES * 8                /* tcache_head[]                          */
+    .skip 8                             /* tcache_bytes                           */
+    .size asm_tcache, TC_CLASSES * 8 + 8
 
     .text
 
@@ -180,9 +207,66 @@ L_malloc:
     .size L_malloc, .-L_malloc
 
 /*==============================================================================
+ * internal: L_malloc_fast(size_t size) -> void *
+ *------------------------------------------------------------------------------
+ * Front end shared by asm_malloc and asm_calloc. Small requests are served from
+ * the calling thread's tcache without touching malloc_lock; a miss, a large
+ * request or an overflow falls through to L_malloc under the lock.
+ *
+ * Parameters (AAPCS64):
+ *   x0 = size (size_t) - requested payload size
+ * Returns:
+ *   x0 = payload pointer, or NULL
+ *============================================================================*/
+    .type  L_malloc_fast, %function
+    .p2align 2
+L_malloc_fast:
+    /* ---- normalise a zero-size request (as L_malloc does) ---- */
+    cbnz    x0, .Lmf_nonzero            /* malloc(0) -> a unique small block     */
+    mov     x0, #1                      /* treat malloc(0) as 1 byte             */
+.Lmf_nonzero:
+    /* ---- size the payload and derive the class ---- */
+    adds    x1, x0, #15                 /* align the payload to 16               */
+    b.cs    .Lmf_slow                   /* size overflow -> let L_malloc fail    */
+    and     x1, x1, #-16                /* x1 = 16-aligned payload               */
+    adds    x2, x1, #HDR                /* total = aligned payload + header      */
+    b.cs    .Lmf_slow                   /* total overflow -> locked path         */
+    cmp     x2, #SMALL_TOTAL_MAX        /* small class?                          */
+    b.hi    .Lmf_slow                   /* large -> locked path                  */
+    /* ---- small: pop from the thread-local cache (no lock) ---- */
+    lsr     x3, x2, #4                  /* class index = total / 16              */
+    mrs     x9, tpidr_el0               /* x9 = thread pointer                   */
+    add     x9, x9, :tprel_hi12:asm_tcache
+    add     x9, x9, :tprel_lo12_nc:asm_tcache   /* x9 = this thread's tcache    */
+    ldr     x4, [x9, x3, lsl #3]        /* tc_head[class] (x0 still holds size)  */
+    cbz     x4, .Lmf_slow               /* empty -> locked refill path           */
+    ldr     x10, [x4]                   /* next = block->next                    */
+    str     x10, [x9, x3, lsl #3]       /* tc_head[class] = next                 */
+    lsl     x10, x3, #4                 /* class bytes = class * 16              */
+    ldr     x11, [x9, #TC_BYTES_OFF]    /* tc_bytes                              */
+    sub     x11, x11, x10               /* tc_bytes -= class bytes               */
+    str     x11, [x9, #TC_BYTES_OFF]
+    sub     x11, x4, #HDR               /* stamp the class index                 */
+    str     x3, [x11]
+    str     xzr, [x11, #8]              /* clear the large-size slot             */
+    mov     x0, x4                      /* return the cached block               */
+    ret
+    /* ---- miss / large / overflow: take the lock ---- */
+.Lmf_slow:
+    stp     x19, x30, [sp, #-16]!       /* preserve scratch + lr, keep aligned   */
+    bl      L_lock                      /* enter the critical section            */
+    bl      L_malloc                    /* allocate under the lock               */
+    mov     x19, x0                     /* stash the result across the unlock    */
+    bl      L_unlock                    /* leave the critical section            */
+    mov     x0, x19                     /* restore the result                    */
+    ldp     x19, x30, [sp], #16
+    ret
+    .size L_malloc_fast, .-L_malloc_fast
+
+/*==============================================================================
  * void *asm_malloc(size_t size)
  *------------------------------------------------------------------------------
- * Thread-safe front end: holds malloc_lock for the whole of L_malloc.
+ * Thread-safe front end: thread-local fast path with a locked fallback.
  *
  * Parameters (AAPCS64):
  *   x0 = size (size_t) - requested payload size
@@ -193,14 +277,7 @@ L_malloc:
     .type  asm_malloc, %function
     .p2align 2
 asm_malloc:
-    stp     x19, x30, [sp, #-16]!       /* preserve lr, keep rsp aligned         */
-    bl      L_lock                      /* enter the critical section            */
-    bl      L_malloc                    /* allocate under the lock               */
-    mov     x19, x0                     /* stash the result across the unlock    */
-    bl      L_unlock                    /* leave the critical section            */
-    mov     x0, x19                     /* restore the result                    */
-    ldp     x19, x30, [sp], #16
-    ret
+    b       L_malloc_fast               /* share the fast + locked front end     */
     .size asm_malloc, .-asm_malloc
 
 /*==============================================================================
@@ -252,7 +329,9 @@ L_free:
 /*==============================================================================
  * void asm_free(void *ptr)
  *------------------------------------------------------------------------------
- * Thread-safe front end: holds malloc_lock around L_free.
+ * Thread-safe front end. A small block is parked on the calling thread's tcache
+ * (without malloc_lock) while that stays within TCACHE_BUDGET; over-budget
+ * frees, large mappings and indirect blocks go through L_free under the lock.
  *
  * Parameters (AAPCS64):
  *   x0 = ptr (void *) - block previously returned by asm_malloc
@@ -261,6 +340,32 @@ L_free:
     .type  asm_free, %function
     .p2align 2
 asm_free:
+    /* ---- NULL is a no-op ---- */
+    cbz     x0, .Lasmfree_ret           /* free(NULL) is a no-op                 */
+    /* ---- recover the class index from the header ---- */
+    ldr     x1, [x0, #-HDR]             /* class index, -1 or -2                 */
+    cmn     x1, #1                      /* large mapping marker?                 */
+    b.eq    .Lasmfree_slow              /* yes -> release under the lock         */
+    cmn     x1, #2                      /* aligned/indirect marker?              */
+    b.eq    .Lasmfree_slow              /* yes -> release under the lock         */
+    /* ---- small: park it on this thread's cache if there is budget ---- */
+    lsl     x2, x1, #4                  /* class bytes = class * 16              */
+    mrs     x9, tpidr_el0               /* x9 = thread pointer                   */
+    add     x9, x9, :tprel_hi12:asm_tcache
+    add     x9, x9, :tprel_lo12_nc:asm_tcache   /* x9 = this thread's tcache    */
+    ldr     x10, [x9, #TC_BYTES_OFF]    /* tc_bytes                              */
+    add     x10, x10, x2                /* projected total                       */
+    mov     x11, #TCACHE_BUDGET
+    cmp     x10, x11                    /* over the per-thread budget?           */
+    b.hi    .Lasmfree_slow              /* yes -> give it to the global heap     */
+    str     x10, [x9, #TC_BYTES_OFF]    /* commit the new total                  */
+    ldr     x10, [x9, x1, lsl #3]       /* old head                              */
+    str     x10, [x0]                   /* block->next = old head                */
+    str     x0, [x9, x1, lsl #3]        /* tc_head[class] = block                */
+.Lasmfree_ret:
+    ret                                 /* return (block cached or NULL)         */
+    /* ---- large/indirect: take the lock ---- */
+.Lasmfree_slow:
     str     x30, [sp, #-16]!            /* preserve lr, keep rsp aligned         */
     bl      L_lock                      /* enter the critical section            */
     bl      L_free                      /* release under the lock                */
@@ -294,13 +399,11 @@ asm_calloc:
     cbnz    x19, .Lcalloc_go            /* count*size == 0?                      */
     mov     x19, #1                     /* treat zero request as 1 byte          */
 .Lcalloc_go:
-    /* ---- allocate under the lock ---- */
-    bl      L_lock                      /* enter the critical section            */
+    /* ---- allocate (thread-local fast path, else under the lock) ---- */
     mov     x0, x19                     /* arg1 = total bytes                    */
-    bl      L_malloc                    /* allocate the block                    */
+    bl      L_malloc_fast               /* allocate the block                    */
     mov     x20, x0                     /* keep the block                        */
-    bl      L_unlock                    /* leave the critical section            */
-    /* ---- zero the block outside the lock (it is on no free list) ---- */
+    /* ---- zero the block (it is on no free list) ---- */
     cbz     x20, .Lcalloc_fail          /* allocation failed -> return NULL      */
     mov     x0, x20                     /* arg1 = block                          */
     mov     w1, #0                      /* fill byte = 0                         */

@@ -29,13 +29,25 @@
 ;   backing block with room for the alignment slack, then stamping an indirect
 ;   header in front of the aligned payload.
 ;
-; The heap is thread-safe via a single global spinlock (malloc_lock) that
-; serialises every free-list and header update, so concurrent callers can share
-; one address space. It is not async-signal-safe: do not call these routines
-; from a signal handler that may interrupt an allocation on the same thread.
-; Small-run memory is never returned to the kernel (like a slab); large blocks
-; are. That matches the usual malloc workhorse pattern while staying small and
-; dependency free.
+; Thread safety
+; -------------
+; Each thread keeps a small thread-local cache (tcache) of freed small blocks:
+; malloc pops from it and free pushes to it without taking malloc_lock, so the
+; uncontended common case stays a couple of instructions. The global spinlock
+; (malloc_lock) then only guards run refills, over-budget frees, large mappings
+; and the aligned machinery. The cache is bounded by a per-thread byte budget
+; (TCACHE_BUDGET) so memory cannot be retained without limit. The trade-off is
+; that blocks still parked in a thread's cache when that thread exits are not
+; reclaimed: flushing them would need a pthread/libc thread-exit hook, which
+; this library deliberately does not depend on.
+;
+; The cache lives in ELF initial-exec TLS. That needs the Linux loader or C
+; runtime to have set up the thread pointer; the malloc heap already targets
+; Linux (raw mmap), so this is the only extra runtime requirement it adds. It is
+; not async-signal-safe: do not call these routines from a signal handler that
+; may interrupt an allocation on the same thread. Small-run memory is never
+; returned to the kernel (like a slab); large blocks are. That matches the usual
+; malloc workhorse pattern while staying small and dependency free.
 ;==============================================================================
 
 BITS 64
@@ -54,12 +66,23 @@ extern asm_sys_munmap
 %define NUM_CLASSES     512             ; size_t NUM_CLASSES - free-list slots (max class index 256)
 %define INDIRECT        (-2)            ; size_t INDIRECT - aligned/indirect block marker
 %define SIZE_MAX        (-1)            ; size_t SIZE_MAX - largest representable size_t
+%define TC_CLASSES      (SMALL_TOTAL_MAX / HDR + 1) ; size_t TC_CLASSES - tcache bins (classes 0..256)
+%define TC_BYTES_OFF    (TC_CLASSES * 8) ; size_t TC_BYTES_OFF - byte counter in the TLS block
+%define TCACHE_BUDGET   (1024 * 1024)   ; size_t TCACHE_BUDGET - cached payload bytes per thread
 
 section .bss
 align 64
 malloc_freelist: resq NUM_CLASSES       ; one singly-linked list per size class
 align 64
 malloc_lock:     resd 1                 ; global spinlock: 0 = free, 1 = held
+
+; Per-thread small-block cache (initial-exec TLS, zero-filled by the loader).
+section .tbss
+align 64
+global asm_tcache:data
+asm_tcache:
+tcache_head:     resq TC_CLASSES        ; one LIFO head per small size class
+tcache_bytes:    resq 1                 ; live cached bytes in this thread's bins
 
 section .text
 
@@ -137,9 +160,67 @@ L_malloc:
     ret                                 ; return NULL
 
 ;==============================================================================
+; internal: L_malloc_fast(size_t size) -> void *
+;------------------------------------------------------------------------------
+; Front end shared by asm_malloc and asm_calloc. Small requests are served from
+; the calling thread's tcache without touching malloc_lock; a miss, a large
+; request or an overflow falls through to L_malloc under the lock.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = size (size_t)  - requested payload size
+; Returns:
+;   rax = payload pointer, or NULL
+; Uses / clobbers:
+;   Reads rdi; writes rax, rcx, rdx, r8, r9. Preserves callee-saved registers.
+;==============================================================================
+L_malloc_fast:
+    push    rbx                         ; preserve callee-saved + keep rsp aligned
+    ; ---- normalise a zero-size request (as L_malloc does) ----
+    test    rdi, rdi                    ; malloc(0) -> a unique small block
+    jnz     .nonzero                    ; size != 0 -> keep it
+    mov     edi, 1                      ; treat malloc(0) as 1 byte
+.nonzero:
+    ; ---- size the payload and derive the class ----
+    mov     rax, rdi                    ; align the payload to 16
+    add     rax, 15                     ; rax = size + 15 (round-up bias)
+    jc      .slow                       ; overflow -> let L_malloc fail cleanly
+    and     rax, -16                    ; rax = 16-aligned payload
+    mov     rcx, rax                    ; rcx = aligned payload
+    add     rcx, HDR                    ; total = aligned payload + header
+    jc      .slow                       ; total overflow -> locked path
+    cmp     rcx, SMALL_TOTAL_MAX        ; small class?
+    ja      .slow                       ; large -> locked path
+    ; ---- small: pop from the thread-local cache (no lock) ----
+    mov     rdx, rcx                    ; class index = total / 16
+    shr     rdx, 4                      ; class index = total / 16
+    mov     r8, [rel asm_tcache wrt ..gottpoff]
+    add     r8, fs:0                    ; r8 = this thread's tcache
+    mov     rax, [r8+rdx*8]             ; tc_head[class]
+    test    rax, rax                    ; cache hit?
+    jz      .slow                       ; empty -> locked refill path
+    mov     r9, [rax]                   ; next = block->next
+    mov     [r8+rdx*8], r9              ; tc_head[class] = next
+    mov     r9, rdx                     ; class bytes = class * 16
+    shl     r9, 4                       ; class bytes
+    sub     [r8+TC_BYTES_OFF], r9       ; tc_bytes -= class bytes
+    mov     [rax-HDR], rdx              ; stamp the class index
+    mov     qword [rax-HDR+8], 0        ; clear the large-size slot
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return the cached block
+    ; ---- miss / large / overflow: take the lock ----
+.slow:
+    call    L_lock                      ; enter the critical section
+    call    L_malloc                    ; allocate under the lock
+    mov     rbx, rax                    ; stash the result across the unlock
+    call    L_unlock                    ; leave the critical section
+    mov     rax, rbx                    ; restore the result
+    pop     rbx                         ; restore callee-saved register
+    ret                                 ; return the block
+
+;==============================================================================
 ; void *asm_malloc(size_t size)
 ;------------------------------------------------------------------------------
-; Thread-safe front end: holds malloc_lock for the whole of L_malloc.
+; Thread-safe front end: thread-local fast path with a locked fallback.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = size (size_t)  - requested payload size
@@ -148,14 +229,7 @@ L_malloc:
 ;==============================================================================
 global asm_malloc:function
 asm_malloc:
-    push    rbx                         ; preserve callee-saved + keep rsp aligned
-    call    L_lock                      ; enter the critical section
-    call    L_malloc                    ; allocate under the lock
-    mov     rbx, rax                    ; stash the result across the unlock
-    call    L_unlock                    ; leave the critical section
-    mov     rax, rbx                    ; restore the result
-    pop     rbx                         ; restore callee-saved register
-    ret                                 ; return the block
+    jmp     L_malloc_fast               ; share the fast + locked front end
 
 ;==============================================================================
 ; internal: L_free(void *ptr) -> void
@@ -211,7 +285,9 @@ L_free:
 ;==============================================================================
 ; void asm_free(void *ptr)
 ;------------------------------------------------------------------------------
-; Thread-safe front end: holds malloc_lock around L_free.
+; Thread-safe front end. A small block is parked on the calling thread's tcache
+; (without malloc_lock) while that stays within TCACHE_BUDGET; over-budget
+; frees, large mappings and indirect blocks go through L_free under the lock.
 ;
 ; Parameters (System V AMD64 ABI):
 ;   rdi = ptr (void *)  - block previously returned by asm_malloc
@@ -220,6 +296,32 @@ L_free:
 ;==============================================================================
 global asm_free:function
 asm_free:
+    ; ---- NULL is a no-op ----
+    test    rdi, rdi                    ; ptr == NULL?
+    jz      .ret                        ; free(NULL) is a no-op
+    ; ---- recover the class index from the header ----
+    mov     rax, [rdi-HDR]              ; class index, -1 or -2
+    cmp     rax, -1                     ; large mapping marker?
+    je      .slow                       ; yes -> release under the lock
+    cmp     rax, INDIRECT               ; aligned/indirect marker?
+    je      .slow                       ; yes -> release under the lock
+    ; ---- small: park it on this thread's cache if there is budget ----
+    mov     rcx, rax                    ; class bytes = class * 16
+    shl     rcx, 4                      ; class bytes
+    mov     r8, [rel asm_tcache wrt ..gottpoff]
+    add     r8, fs:0                    ; r8 = this thread's tcache
+    mov     r9, [r8+TC_BYTES_OFF]       ; tc_bytes
+    add     r9, rcx                     ; projected total
+    cmp     r9, TCACHE_BUDGET           ; over the per-thread budget?
+    ja      .slow                       ; yes -> give it to the global heap
+    mov     [r8+TC_BYTES_OFF], r9       ; commit the new total
+    mov     r9, [r8+rax*8]              ; old head
+    mov     [rdi], r9                   ; block->next = old head
+    mov     [r8+rax*8], rdi             ; tc_head[class] = block
+.ret:
+    ret                                 ; return (block cached or NULL)
+    ; ---- large/indirect: take the lock ----
+.slow:
     push    rbx                         ; preserve callee-saved + keep rsp aligned
     call    L_lock                      ; enter the critical section
     call    L_free                      ; release under the lock
@@ -239,7 +341,7 @@ asm_free:
 ;   rax = zeroed block, or NULL on overflow or allocation failure
 ; Uses / clobbers:
 ;   Reads rdi, rsi; writes rax, rdx. Pushes/restores rbx, r12, r13.
-;   Calls L_malloc under the lock, then asm_memset outside it.
+;   Calls L_malloc_fast (tcache/locked), then asm_memset on the fresh block.
 ;==============================================================================
 global asm_calloc:function
 asm_calloc:
@@ -257,13 +359,11 @@ asm_calloc:
     jnz     .go                         ; non-zero -> allocate as is
     mov     ebx, 1                      ; treat zero request as 1 byte
 .go:
-    ; ---- allocate under the lock ----
-    call    L_lock                      ; enter the critical section
+    ; ---- allocate (thread-local fast path, else under the lock) ----
     mov     rdi, rbx                    ; arg1 = total bytes
-    call    L_malloc                    ; allocate the block
+    call    L_malloc_fast               ; allocate the block
     mov     r12, rax                    ; keep the block
-    call    L_unlock                    ; leave the critical section
-    ; ---- zero the block outside the lock (it is on no free list) ----
+    ; ---- zero the block (it is on no free list) ----
     test    r12, r12                    ; allocation succeeded?
     jz      .fail                       ; failed -> return NULL
     mov     rdi, r12                    ; arg1 = block

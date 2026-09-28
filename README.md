@@ -46,10 +46,10 @@ freestanding targets get the memory/string/allocator API plus the math library.
   AArch64) let both the arena and the malloc heap obtain memory with no libc
   and no caller-supplied allocator.
 * **Chunked, resettable arena allocator** with alignment, mark/release and
-  optional growth. 3–19x faster than `malloc`/`free` for the bursts arenas
-  exist for, and ~33x faster for a bulk reset of thousands of blocks.
+  optional growth. 3–20x faster than `malloc`/`free` for the bursts arenas
+  exist for, and 30–45x faster for a bulk reset of thousands of blocks.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
-  `mmap`; up to about 4x faster than glibc's allocator for burst workloads.
+  `mmap`; roughly 5–8x faster than glibc's allocator for burst workloads.
 * **Freestanding math library** for WebAssembly and bare-metal targets: 112
   double- and single-precision routines (`sin`/`sinf`, `log`/`logf`,
   `pow`/`powf`, `cbrt`, `erf`, …) in portable C with no libc, no `libm`, no
@@ -240,10 +240,14 @@ must be freed individually rather than in bulk.
 Small requests come from per-size-class slab runs replenished by `mmap`;
 requests above 4080 bytes get an individual page-rounded mapping. Pointers
 from `asm_malloc` must be released with `asm_free` (and not with libc `free`).
-The heap is thread-safe: a single global spinlock serialises the free lists and
-the large-mapping path, so `asm_malloc`/`asm_free`/`asm_realloc`/… may be called
-concurrently from multiple threads in one address space. (The lock is a
-spinlock, so the allocator is not async-signal-safe, and the arena allocator
+The heap is thread-safe: each thread keeps a **thread-local cache** of freed
+small blocks (initial-exec TLS on x86-64, local-exec on AArch64), so the hot
+`asm_malloc`/`asm_free` path touches no lock at all; a single global spinlock
+only serialises run refills, over-budget frees, large mappings and the aligned
+machinery. The cache is bounded by a per-thread byte budget (1 MiB) so memory
+cannot grow without limit — but blocks still in a thread's cache when it exits
+are not reclaimed, since flushing them would require a pthread/libc exit hook.
+(The lock makes the allocator not async-signal-safe, and the arena allocator
 remains single-threaded by design.) Small-class runs are retained for reuse.
 `asm_posix_memalign`/`asm_aligned_alloc` support any power-of-two alignment
 via a small indirect header, and the resulting pointers are released normally
@@ -382,8 +386,9 @@ design using NEON and AAPCS64 (see [AArch64 port](#aarch64-port)).
   are rounded to a 16-byte size class and served from a per-class free list
   replenished by a slab run; larger requests get their own page-rounded
   mapping. Every block is 16-byte aligned and carries a 16-byte header with
-  its class (or the mapping length), so `free` needs no size argument. The
-  heap is thread-safe (spinlock) and retains small-class runs.
+  its class (or the mapping length), so `free` needs no size argument. Each
+  thread caches its own freed small blocks in TLS for a lock-free hot path;
+  a global spinlock guards the shared lists and retains small-class runs.
 
 ### Performance approach
 
@@ -423,8 +428,9 @@ zeroing, `realloc` in place and across the small/large boundary, and a
 200,000-operation randomised alloc/free/realloc stress test with content
 tagging. `make test` also runs the multithreaded stress tests
 (`tests/test_alloc_mt.c` and `tests/test_portable_alloc_mt.c`): several threads
-run millions of mixed allocate/free/realloc operations with per-block tags and
-report any corruption, exercising both allocators' locks.
+run millions of mixed allocate/free/realloc operations with per-block tags,
+hand blocks to each other to free cross-thread, and report any corruption,
+exercising both allocators' locks and the thread-local caches.
 
 `make test-math` runs one differential binary per math family
 (`tests/test_math_*.c`). Each compares the implementation against the host
@@ -466,20 +472,22 @@ ns per operation):
 
 ```
 workload                              asm       malloc   speedup
-arena   1000 x 64B                   3.05        26.07     8.55x
-arena   4000 mixed 8..512B           3.04        56.81    18.72x
-arena   1000 x 64B +memset           8.24        27.77     3.37x
-malloc  1000 x 64B                  14.78        26.02     1.76x
-malloc  4000 mixed 8..512B          14.48        53.41     3.69x
-2048 x 1KiB fill+release (us)        13.27       435.26    32.80x
+arena   1000 x 64B                   4.36        37.46     8.59x
+arena   4000 mixed 8..512B           4.35        86.13    19.80x
+arena   1000 x 64B +memset           7.29        43.52     5.97x
+malloc  1000 x 64B                   8.55        40.94     4.79x
+malloc  4000 mixed 8..512B          11.53        93.10     8.08x
+2048 x 1KiB fill+release (us)        22.28      1012.72    45.46x
 ```
 
 The arena wins because allocation is a pointer bump, the memory is contiguous
 (cache-predictable), and a reset is one rewind rather than thousands of
-`free` calls. The malloc heap wins over glibc on burst workloads because its
-per-class free lists are a couple of instructions. The trade-offs — the arena
-reclaims in bulk or to a mark, and the arena stays single-threaded while the
-malloc heap takes a lock, are the usual ones for these designs.
+`free` calls. The malloc heap now wins over glibc on burst workloads too: the
+thread-local cache makes the steady-state `malloc`/`free` path a couple of
+instructions, so the global lock only appears on refills and over-budget
+frees. The trade-offs — the arena reclaims in bulk or to a mark and stays
+single-threaded, while the malloc heap takes a lock off the hot path, are the
+usual ones for these designs.
 
 `make bench-math` runs `bench/math_bench.c`, which times every math routine
 against the host `libm` on representative inputs (best of 7, ns/call). On the
@@ -606,6 +614,8 @@ OS or libc dependency and link under `-nostdlib`. The only platform-specific
 code is the syscall layer (`src/sys.asm` on x86-64, `src/aarch64/sys.S` on
 AArch64); on bare metal or another OS, pass your own `alloc`/`free` to
 `asm_arena_init_grow` and skip `asm_arena_init_mmap` and `asm_malloc`. The
+malloc heap additionally assumes a runtime that has set up the thread pointer
+for its TLS cache, so it is not for `-nostdlib` bare-metal use. The
 test/benchmark harnesses use libc, but the library itself does not.
 
 The math library (`src/math/`) is freestanding by construction: it calls no

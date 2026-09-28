@@ -190,11 +190,52 @@ cleanup:
     }
 }
 
+/*------------------------------------------------------------------------------
+ * Cross-thread hand-off: each thread allocates a slice, then frees the slice
+ * owned by another thread. A block freed on a thread other than the one that
+ * allocated it must land in the freeing thread's tcache (or the global heap)
+ * without corruption.
+ *----------------------------------------------------------------------------*/
+#define XT_N 4096
+static unsigned char *xt_p[XT_N];
+static size_t         xt_sz[XT_N];
+static unsigned char  xt_tag[XT_N];
+static long           xt_bad;
+
+static void run_cross(int nthreads, int id) {
+    int per = XT_N / nthreads;
+    int lo = id * per;
+    int hi = (id == nthreads - 1) ? XT_N : lo + per;
+
+    for (int i = lo; i < hi; i++) {
+        size_t s = 1 + (size_t)(i % 1500);
+        unsigned char t = (unsigned char)(i | 1);
+        xt_p[i] = asm_malloc(s);
+        xt_sz[i] = s; xt_tag[i] = t;
+        if (xt_p[i]) memset(xt_p[i], t, s);
+        else __atomic_store_n(&xt_bad, 1, __ATOMIC_RELAXED);
+    }
+    pthread_barrier_wait(&g_start);      /* wait until every slice is filled */
+
+    int nid = (id + 1) % nthreads;
+    int nlo = nid * per;
+    int nhi = (nid == nthreads - 1) ? XT_N : nlo + per;
+    for (int i = nlo; i < nhi; i++) {
+        if (!xt_p[i]) continue;
+        if (xt_p[i][0] != xt_tag[i] || xt_p[i][xt_sz[i] - 1] != xt_tag[i])
+            __atomic_store_n(&xt_bad, 1, __ATOMIC_RELAXED);
+        asm_free(xt_p[i]);
+    }
+}
+
+static int g_nthreads = 1;
+
 static void *worker(void *arg) {
     targ_t *t = arg;
     pthread_barrier_wait(&g_start);          /* start all threads together */
     run_random(t);
     run_hot(t);
+    run_cross(g_nthreads, t->id);
     return NULL;
 }
 
@@ -222,6 +263,7 @@ int main(int argc, char **argv) {
         printf("FAIL: barrier init\n");
         return 1;
     }
+    g_nthreads = (int)nthreads;
     for (long i = 0; i < nthreads; i++) {
         args[i].id = (int)i;
         args[i].iters = iters;
@@ -237,6 +279,7 @@ int main(int argc, char **argv) {
         corrupt += args[i].corrupt;
         ops += args[i].ops;
     }
+    corrupt += __atomic_load_n(&xt_bad, __ATOMIC_RELAXED);
     pthread_barrier_destroy(&g_start);
     free(tid);
     free(args);
