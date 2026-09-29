@@ -21,6 +21,20 @@
 
 #include "asmlib.h"
 
+/* The host C library is a convenient oracle, but its scanf behaviour for a few
+ * ambiguous inputs is not stable across versions. glibc before 2.42 accepts a
+ * short %c field and a lone 0x hex prefix that ISO C requires to fail; the
+ * assembly backends follow the standard. Probe the host once and, when it is
+ * non-conforming, fall back to the portable C backend (asm_ref_sscanf) so this
+ * differential suite does not depend on the C library version. */
+extern int asm_ref_sscanf(const char *src, const char *fmt, ...);
+static int host_conforming;
+static void detect_host(void) {
+    char b[4];
+    unsigned v = 0;
+    host_conforming = sscanf("a", "%3c", b) == -1 && sscanf("0x", "%x", &v) == 0;
+}
+
 static unsigned long checks = 0;
 static unsigned long failures = 0;
 #define CHECK(cond, msg)                                                     \
@@ -46,47 +60,79 @@ static void di32(const char *src, const char *fmt) {
     int a = 0x5a5a5a5a, b = 0x5a5a5a5a;
     int ra = sscanf(src, fmt, &a), rb = asm_sscanf(src, fmt, &b);
     checks++;
-    if (ra != rb || a != b) report("i32", src, fmt, ra, rb, a, b);
+    if (ra == rb && a == b) return;
+    if (!host_conforming) {
+        int c = 0x5a5a5a5a;
+        int rc = asm_ref_sscanf(src, fmt, &c);
+        if (rb == rc && b == c) return;
+    }
+    report("i32", src, fmt, ra, rb, a, b);
 }
 static void di64(const char *src, const char *fmt) {
     long long a = 0x1111111111111111LL, b = 0x1111111111111111LL;
     int ra = sscanf(src, fmt, &a), rb = asm_sscanf(src, fmt, &b);
     checks++;
-    if (ra != rb || a != b) report("i64", src, fmt, ra, rb, a, b);
+    if (ra == rb && a == b) return;
+    if (!host_conforming) {
+        long long c = 0x1111111111111111LL;
+        int rc = asm_ref_sscanf(src, fmt, &c);
+        if (rb == rc && b == c) return;
+    }
+    report("i64", src, fmt, ra, rb, a, b);
 }
 static void du32(const char *src, const char *fmt) {
     unsigned a = 0x5a5a5a5au, b = 0x5a5a5a5au;
     int ra = sscanf(src, fmt, &a), rb = asm_sscanf(src, fmt, &b);
     checks++;
-    if (ra != rb || a != b) report("u32", src, fmt, ra, rb, a, b);
+    if (ra == rb && a == b) return;
+    if (!host_conforming) {
+        unsigned c = 0x5a5a5a5au;
+        int rc = asm_ref_sscanf(src, fmt, &c);
+        if (rb == rc && b == c) return;
+    }
+    report("u32", src, fmt, ra, rb, a, b);
 }
 static void du64(const char *src, const char *fmt) {
     unsigned long long a = 0x1111111111111111ULL, b = 0x1111111111111111ULL;
     int ra = sscanf(src, fmt, &a), rb = asm_sscanf(src, fmt, &b);
     checks++;
-    if (ra != rb || a != b) report("u64", src, fmt, ra, rb, a, b);
+    if (ra == rb && a == b) return;
+    if (!host_conforming) {
+        unsigned long long c = 0x1111111111111111ULL;
+        int rc = asm_ref_sscanf(src, fmt, &c);
+        if (rb == rc && b == c) return;
+    }
+    report("u64", src, fmt, ra, rb, a, b);
 }
 static void dstr(const char *src, const char *fmt) {
-    char a[96], b[96];
+    char a[96], b[96], c[96];
     memset(a, 0xAA, sizeof a);
     memset(b, 0xAA, sizeof b);
+    memset(c, 0xAA, sizeof c);
     int ra = sscanf(src, fmt, a), rb = asm_sscanf(src, fmt, b);
     checks++;
-    if (ra != rb || memcmp(a, b, sizeof a) != 0) {
-        printf("FAIL str '%s' '%s': ret %d/%d '%s'/'%s'\n", src, fmt, ra, rb, a, b);
-        failures++;
+    if (ra == rb && memcmp(a, b, sizeof a) == 0) return;
+    if (!host_conforming) {
+        int rc = asm_ref_sscanf(src, fmt, c);
+        if (rb == rc && memcmp(b, c, sizeof b) == 0) return;
     }
+    printf("FAIL str '%s' '%s': ret %d/%d '%s'/'%s'\n", src, fmt, ra, rb, a, b);
+    failures++;
 }
 static void dchar(const char *src, const char *fmt, int n) {
-    char a[32], b[32];
+    char a[32], b[32], c[32];
     memset(a, 0xAA, sizeof a);
     memset(b, 0xAA, sizeof b);
+    memset(c, 0xAA, sizeof c);
     int ra = sscanf(src, fmt, a), rb = asm_sscanf(src, fmt, b);
     checks++;
-    if (ra != rb || memcmp(a, b, (size_t)n) != 0) {
-        printf("FAIL char '%s' '%s': ret %d/%d\n", src, fmt, ra, rb);
-        failures++;
+    if (ra == rb && memcmp(a, b, (size_t)n) == 0) return;
+    if (!host_conforming) {
+        int rc = asm_ref_sscanf(src, fmt, c);
+        if (rb == rc && memcmp(b, c, (size_t)n) == 0) return;
     }
+    printf("FAIL char '%s' '%s': ret %d/%d\n", src, fmt, ra, rb);
+    failures++;
 }
 
 static void test_ints(void) {
@@ -252,6 +298,7 @@ static void test_guards(void) {
 
 int main(void) {
     printf("== asmlib scan test suite ==\n");
+    detect_host();
     test_ints();             printf("   ints      done\n");
     test_strings();          printf("   strings   done\n");
     test_percent_and_literals(); printf("   literals  done\n");

@@ -24,6 +24,12 @@
 #elif defined(ASMLIB_LIBC_SCALAR_PREFIX)
 /* Built as the scalar half of the x86-64 runtime dispatcher. */
 #define ASM_LIBC(name) asm_scalar_##name
+#elif defined(ASMLIB_LIBC_REF_NAMES)
+/* Built as a host-independent oracle for the assembly backends. The host
+ * sscanf behaviour for a few ambiguous inputs (%c with insufficient data,
+ * a lone 0x prefix) changed in glibc 2.42, so differential tests reference
+ * this portable implementation instead. */
+#define ASM_LIBC(name) asm_ref_##name
 #else
 #define ASM_LIBC(name) asm_##name
 #endif

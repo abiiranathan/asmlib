@@ -154,6 +154,12 @@ $(BUILD)/test_scalar: tests/test_portable.c $(SCALAR_LIB) $(HEADER)
 test-scalar: $(BUILD)/test_scalar
 	./$(BUILD)/test_scalar
 
+# Portable C scanner built as asm_ref_sscanf: a host-independent oracle for the
+# scan differential tests (the host libc's ambiguous scanf cases changed in
+# glibc 2.42, so the tests cannot rely on it unconditionally).
+$(BUILD)/scan_ref.o: src/libc/scan.c src/libc/portable.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -DASMLIB_LIBC_REF_NAMES -c -o $@ $<
+
 # ---- tests ------------------------------------------------------------------
 $(TEST_BIN): tests/test_asmlib.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ tests/test_asmlib.c $(STATIC) $(LDFLAGS)
@@ -167,8 +173,8 @@ $(TEST_ALLOC_BIN): tests/test_alloc.c $(STATIC) $(HEADER)
 $(TEST_FORMAT_BIN): tests/test_format.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ tests/test_format.c $(STATIC) $(LDFLAGS)
 
-$(TEST_SCAN_BIN): tests/test_scan.c $(STATIC) $(HEADER)
-	$(CC) $(CFLAGS) -o $@ tests/test_scan.c $(STATIC) $(LDFLAGS)
+$(TEST_SCAN_BIN): tests/test_scan.c $(STATIC) $(BUILD)/scan_ref.o $(HEADER)
+	$(CC) $(CFLAGS) -o $@ tests/test_scan.c $(BUILD)/scan_ref.o $(STATIC) $(LDFLAGS)
 
 $(TEST_LINALG_BIN): tests/test_linalg.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ tests/test_linalg.c $(STATIC) -lm $(LDFLAGS)
@@ -237,7 +243,7 @@ test-valgrind: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN)
 		--errors-for-leak-kinds=definite --undef-value-errors=no ./$(TEST_ALLOC_BIN)
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
-test-asan: tests/test_asmlib.c tests/test_arena.c tests/test_alloc.c tests/test_format.c tests/test_scan.c tests/test_linalg.c $(STATIC) $(HEADER)
+test-asan: tests/test_asmlib.c tests/test_arena.c tests/test_alloc.c tests/test_format.c tests/test_scan.c tests/test_linalg.c $(STATIC) $(BUILD)/scan_ref.o $(HEADER)
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_asan tests/test_asmlib.c $(STATIC)
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_asan
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_arena_asan tests/test_arena.c $(STATIC)
@@ -246,7 +252,7 @@ test-asan: tests/test_asmlib.c tests/test_arena.c tests/test_alloc.c tests/test_
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_alloc_asan
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_format_asan tests/test_format.c $(STATIC)
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_format_asan
-	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_scan_asan tests/test_scan.c $(STATIC)
+	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_scan_asan tests/test_scan.c $(BUILD)/scan_ref.o $(STATIC)
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_scan_asan
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $(BUILD)/test_linalg_asan tests/test_linalg.c $(STATIC) -lm
 	ASAN_OPTIONS=detect_leaks=1 ./$(BUILD)/test_linalg_asan
@@ -329,8 +335,8 @@ $(BUILD)/test_portable_alloc: tests/test_portable_alloc.c src/libc/alloc.c src/l
 $(BUILD)/test_portable_format: tests/test_format.c src/libc/format.c src/libc/portable.h include/asmlib.h | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_format.c src/libc/format.c
 
-$(BUILD)/test_portable_scan: tests/test_scan.c src/libc/scan.c src/libc/portable.h include/asmlib.h | $(BUILD)
-	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_scan.c src/libc/scan.c
+$(BUILD)/test_portable_scan: tests/test_scan.c src/libc/scan.c src/libc/portable.h include/asmlib.h $(BUILD)/scan_ref.o | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_scan.c src/libc/scan.c $(BUILD)/scan_ref.o
 
 $(BUILD)/test_portable_alloc_debug: tests/test_portable_alloc_debug.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -DASMLIB_ALLOC_DEBUG -o $@ tests/test_portable_alloc_debug.c src/libc/alloc.c
@@ -458,8 +464,12 @@ $(BUILD)/aarch64_test_alloc: tests/test_alloc.c $(A64_STATIC) $(HEADER) | $(BUIL
 $(BUILD)/aarch64_test_format: tests/test_format.c $(A64_STATIC) $(HEADER) | $(BUILD)
 	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_format.c $(A64_STATIC)
 
-$(BUILD)/aarch64_test_scan: tests/test_scan.c $(A64_STATIC) $(HEADER) | $(BUILD)
-	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_scan.c $(A64_STATIC)
+$(BUILD)/aarch64/scan_ref.o: src/libc/scan.c src/libc/portable.h | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(A64_CC) $(A64_CFLAGS) -Isrc/libc -DASMLIB_LIBC_REF_NAMES -c -o $@ $<
+
+$(BUILD)/aarch64_test_scan: tests/test_scan.c $(A64_STATIC) $(BUILD)/aarch64/scan_ref.o $(HEADER) | $(BUILD)
+	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_scan.c $(BUILD)/aarch64/scan_ref.o $(A64_STATIC)
 
 $(BUILD)/aarch64_test_linalg: tests/test_linalg.c $(A64_STATIC) $(A64_MATH_OBJ) $(HEADER) | $(BUILD)
 	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_linalg.c $(A64_STATIC) $(A64_MATH_OBJ) -lm
@@ -492,6 +502,14 @@ FUZZ_BINS  := $(BUILD)/fuzz_convert $(BUILD)/fuzz_format $(BUILD)/fuzz_scan $(BU
 
 $(BUILD)/fuzz_%: fuzz/fuzz_%.c $(STATIC) $(HEADER) | $(BUILD)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -o $@ $< $(STATIC) -lm
+
+# fuzz_scan also links the portable scanner as a host-independent reference.
+$(BUILD)/fuzz_scan_ref.o: src/libc/scan.c src/libc/portable.h | $(BUILD)
+	$(FUZZ_CC) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-Isrc/libc -DASMLIB_LIBC_REF_NAMES -c -o $@ $<
+
+$(BUILD)/fuzz_scan: fuzz/fuzz_scan.c $(STATIC) $(BUILD)/fuzz_scan_ref.o $(HEADER) | $(BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -o $@ fuzz/fuzz_scan.c $(BUILD)/fuzz_scan_ref.o $(STATIC) -lm
 
 fuzz: $(FUZZ_BINS)
 	@for b in $(FUZZ_BINS); do \
