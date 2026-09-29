@@ -37,6 +37,7 @@ jobs:
         run: |
           make install DESTDIR="$PWD/stage" PREFIX=/usr
           export PKG_CONFIG_PATH="$PWD/stage/usr/lib/pkgconfig"
+          export PKG_CONFIG_SYSROOT_DIR="$PWD/stage"
           pkg-config --exists asmlib
           printf '#include "asmlib.h"\nint main(void){return asm_strlen("x")!=1;}\n' > /tmp/t.c
           cc /tmp/t.c $(pkg-config --cflags --libs asmlib) -Wl,-rpath,"$PWD/stage/usr/lib" -o /tmp/t

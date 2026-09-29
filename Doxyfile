@@ -61,7 +61,6 @@ GENERATE_AUTOGEN_DEF   = NO
 GENERATE_PERLMOD       = NO
 
 HAVE_DOT               = NO
-CLASS_DIAGRAMS         = NO
 
 SOURCE_BROWSER         = YES
 INLINE_SOURCES         = NO

@@ -538,6 +538,7 @@ docs:
 	    echo "$(DOXYGEN) not found - install doxygen to build the API docs"; \
 	    echo "  Debian/Ubuntu: sudo apt-get install doxygen"; \
 	    echo "  Arch:          sudo pacman -S doxygen"; exit 1; }
+	@mkdir -p $(BUILD)/docs
 	$(DOXYGEN) Doxyfile
 	@echo "API docs -> $(DOCS_HTML)"
 
