@@ -114,14 +114,10 @@ static gdd g_mul(gdd a, gdd b)
 #if defined(__FP_FAST_FMA)
 	p.lo = __builtin_fma(a.hi, b.hi, -p.hi);
 #else
-	{
-		const double split = 134217729.0;	/* 2^27 + 1 */
-		double c, abig, ahi, alo, d, bbig, bhi, blo;
-
-		c = split * a.hi; abig = c - a.hi; ahi = c - abig; alo = a.hi - ahi;
-		d = split * b.hi; bbig = d - b.hi; bhi = d - bbig; blo = b.hi - bhi;
-		p.lo = ((ahi * bhi - p.hi) + ahi * blo + alo * bhi) + alo * blo;
-	}
+	/* No hardware FMA (clang does not define __FP_FAST_FMA even with -mfma,
+	 * and wasm has no FMA at all): use the library's own correctly rounded
+	 * software fma. A Dekker split would overflow for huge inputs here. */
+	p.lo = ASM_MATH(fma)(a.hi, b.hi, -p.hi);
 #endif
 	p.lo += a.hi * b.lo + b.hi * a.lo;
 	return g_quick_two_sum(p.hi, p.lo);
