@@ -23,6 +23,7 @@ default rel
 
 %define SYS_mmap    9                   ; mmap(addr, len, prot, flags, fd, off)
 %define SYS_munmap  11                  ; munmap(addr, len)
+%define SYS_write   1                   ; write(fd, buf, count)
 %define PROT_RW     3                   ; PROT_READ | PROT_WRITE
 %define MAP_ANON_PRIV 0x22              ; MAP_PRIVATE | MAP_ANONYMOUS
 %define ERR_LIMIT   (-4095)             ; values in [-4095,-1] encode -errno
@@ -81,6 +82,26 @@ asm_sys_munmap:
     ; ---- issue munmap with rdi = ptr and rsi = size already in place ----
     mov     eax, SYS_munmap             ; eax = 11 (munmap syscall number)
     syscall                             ; invoke munmap; rax = 0 or -errno, rcx/r11 clobbered
+    ret                                 ; return the kernel result in rax
+
+;==============================================================================
+; long asm_sys_write(int fd, const void *buf, size_t count)
+;------------------------------------------------------------------------------
+; Raw write(2). Used by the formatted-output (dprintf/printf) layer so it can
+; reach a file descriptor without libc. Returns the number of bytes written or
+; -errno; a short write is possible, so callers must loop.
+;
+; Parameters (System V AMD64 ABI):
+;   rdi = fd (int)      - file descriptor
+;   rsi = buf (void *)  - bytes to write
+;   rdx = count (size_t)- byte count
+; Returns:
+;   rax = bytes written, or -errno
+;==============================================================================
+global asm_sys_write:function
+asm_sys_write:
+    mov     eax, SYS_write              ; eax = 1 (write syscall number)
+    syscall                             ; rdi/rsi/rdx already hold fd/buf/count
     ret                                 ; return the kernel result in rax
 
 ;==============================================================================

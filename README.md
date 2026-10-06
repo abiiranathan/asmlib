@@ -13,10 +13,10 @@ header (`asmlib.h`, which also pulls in the math and vector/matrix APIs) plus
 static and shared libraries.
 
 ```
-src/        NASM sources (memory, string, comparison, search, ctype, alloc, format, scan)
+src/        NASM sources (memory, string, comparison, search, ctype, alloc, format, scan, sys)
 src/aarch64/ hand-written AArch64 assembly port (same API, NEON)
 src/math/   freestanding C math library (no libc; builds for wasm32)
-src/libc/   portable C memory/string/allocator/format/scan backend for wasm/freestanding
+src/libc/   portable C memory/string/allocator/printf/sort/scan backend for wasm/freestanding
 include/    asmlib.h / asmlib_math.h / asmlib_vec.h / asmlib_matrix.h
 tests/      differential + page-boundary + arena + malloc + format + scan + linalg + math
 bench/      asmlib vs. libc micro-benchmarks (routines, allocators, formatting, scanning)
@@ -32,16 +32,19 @@ examples/   word-frequency analyser + wasm double-pendulum and image-editor demo
 | WebAssembly (wasm32) | `src/libc/` + `src/math/` — portable C | `clang --target=wasm32-unknown-unknown`, `wasm-ld` |
 | other freestanding | `src/libc/` + `src/math/` — portable C | any C11 compiler |
 
-The x86-64 and AArch64 backends expose the identical `asm_*` API (77 routines
-each) and are validated by the same differential suites; WebAssembly and other
+The x86-64 and AArch64 backends expose the identical `asm_*` API (the
+string/memory/search/ctype routines and the bounded integer formatters are
+hand-written assembly; the printf family and sorting/searching are the shared
+portable C engine) and are validated by the same differential suites;
+WebAssembly and other
 freestanding targets get the memory/string/allocator/format/scan API plus the
 math library.
 
 ## Highlights
 
 * **Memory, string, comparison, search, ctype, an arena allocator, a
-  malloc-style heap, and formatting/scanning helpers** — 77 routines in all, no
-  libc dependency anywhere.
+  malloc-style heap, a full printf family, sorting/searching, and
+  formatting/scanning helpers** — no libc dependency anywhere.
 * **SIMD where it wins.** 32-byte AVX2/BMI scans (`vpsubb`, `vpminub`,
   `tzcnt`/`bsr`) on x86-64 and NEON (`cmeq`/`umaxv`, `ldp`/`stp`) on AArch64,
   both with branchless ASCII case folding.
@@ -59,10 +62,13 @@ math library.
 * **malloc/calloc/realloc/free** on a segregated free-list heap backed by
   `mmap`; roughly 5–8x faster than glibc's allocator for burst workloads.
 * **Fast, safe formatting and scanning.** Bounded
-  `asm_u64toa`/`asm_i64toa`/`asm_u64tohex` converters, `asm_snprintf`
-  (1.5–4x glibc) and `asm_sscanf` (2–3x glibc). Every `%s`/`%c` read is bounded
-  by a required width and the scanner never reads past the input's NUL; no
-  floating point, precision or locale.
+  `asm_u64toa`/`asm_i64toa`/`asm_u64tohex` converters, a complete C99-compliant
+  `asm_snprintf`/`asm_printf`/`asm_asprintf` family (including correctly-rounded
+  `%f`/`%e`/`%g`/`%a`, precision, `*` and `%n`) and `asm_sscanf` (2–3x glibc).
+  Every `%s`/`%c` read is bounded by a required width and the scanner never
+  reads past the input's NUL.
+* **Sorting and searching.** `asm_qsort`/`asm_qsort_r` (introsort) and
+  `asm_bsearch`/`asm_bsearch_r`, libc-compatible and available on every backend.
 * **Vector, matrix and quaternion math.** `asmlib_vec.h` and `asmlib_matrix.h` port
 the solidc Vec2/3/4, Mat3/Mat4 and Quat API (~200 operations) to a
 freestanding, header-only library built on asmlib's own math routines — no
@@ -268,11 +274,14 @@ Predicates return `1` for true and `0` for false.
 ### CPU (`cpu.asm`)
 `unsigned asm_cpu_features(void)` and `int asm_cpu_has_avx2(void)`.
 
-### Formatting (`format.asm`)
+### Formatting (`format.asm` converters, `printf.c` engine)
 
-Bounded integer-to-string converters plus a small, fast snprintf. All are
-freestanding (no libc) and implemented for x86-64, AArch64 and the portable C
-backend.
+Bounded integer-to-string converters, plus a complete, C99-compliant printf
+family. All are freestanding (no libc, no libm) and implemented for x86-64,
+AArch64 and the portable C backend. The integer converters are the hand-written
+assembly fast paths; the formatted-output engine is the portable C
+implementation (`src/libc/printf.c`), linked into every backend so behaviour is
+identical everywhere and floating point is correctly rounded.
 
 | Function | Purpose |
 |---|---|
@@ -280,29 +289,56 @@ backend.
 | `asm_i64toa(value, buf, cap)` | signed decimal (`-` for negatives) |
 | `asm_u64toa_base(value, buf, cap, base)` | base 2..36, lowercase |
 | `asm_u64tohex(value, buf, cap, uppercase)` | hexadecimal, no `0x` |
-| `asm_snprintf(dst, size, fmt, ...)` | minimal snprintf |
+| `asm_snprintf` / `asm_vsnprintf` | bounded formatted output |
+| `asm_sprintf` / `asm_vsprintf` | unbounded formatted output |
+| `asm_asprintf` / `asm_vasprintf` | allocate and format |
+| `asm_printf` / `asm_vprintf` / `asm_dprintf` / `asm_vdprintf` | output to stdout / a file descriptor |
 
-Each converter writes at most `cap` bytes (including a NUL when `cap > 0`) and
-returns the length the full representation needs, so `ret >= cap` flags
-truncation; `cap == 0` writes nothing and returns only the length.
+Each bounded converter writes at most `cap` bytes (including a NUL when
+`cap > 0`) and returns the length the full representation needs, so `ret >= cap`
+flags truncation; `cap == 0` writes nothing and returns only the length.
 
-`asm_snprintf` follows C99 snprintf's return value and bounds. It supports
-`%%`, `%c`, `%s` (NULL prints `(null)`), `%p` (`0x` + lowercase hex, NULL prints
-`(nil)`), `%d`/`%i`, `%u`, `%x`/`%X` and `%o`, with the `-` (left) and `0`
-(zero-pad) flags, a decimal width, and the `l`/`ll` length modifiers for 64-bit
-integers. Anything else after `%` is copied through literally and consumes no
-argument. There is deliberately **no** floating point, precision, `*`, locale or
-`%n`.
+`asm_snprintf` follows C99 snprintf's return value and bounds and supports
+`%%`, `%c`, `%s` (NULL prints `(null)`, precision bounds the length), `%p`
+(`0x` + hex, NULL prints `(nil)`), `%d`/`%i`, `%u`, `%o`, `%x`/`%X`, `%n`, and
+`%f`/`%F`/`%e`/`%E`/`%g`/`%G`/`%a`/`%A`. Flags are `-` (left), `+` (force sign),
+space (sign), `#` (alternate form) and `0` (zero-pad); the width and precision
+may be a decimal or `*`; the length modifiers are `hh`, `h`, `l`, `ll`, `z`, `j`,
+`t`, and `L` for `long double` (narrowed to `double`). Floating-point output is
+**correctly rounded** — round half to even against the exact decimal expansion
+of the binary value — so `%a`/`%e`/`%f`/`%g` match glibc byte for byte. Unknown
+conversions are copied through literally and consume no argument.
 
 ```c
 #include "asmlib.h"
 
-char buf[32];
+char buf[64];
 asm_u64toa(18446744073709551615ULL, buf, sizeof buf);   /* "18446744073709551615" */
 asm_i64toa(-42, buf, sizeof buf);                       /* "-42" */
 asm_u64tohex(0xdeadbeef, buf, sizeof buf, 1);           /* "DEADBEEF" */
 asm_snprintf(buf, sizeof buf, "id=%05d n=%-8s x=0x%08x", 7, "bob", 0xabc);
 /* "id=00007 n=bob      x=0x00000abc" */
+asm_snprintf(buf, sizeof buf, "%.3f %e %g", 3.14159, 2.5e10, 0.0001234);
+/* "3.142 2.500000e+10 0.0001234" */
+char *s; asm_asprintf(&s, "%s-%d", "id", 42);            /* s = "id-42" (asm_free) */
+asm_printf("n=%d\n", 42);                                /* to stdout, no libc */
+```
+
+### Sorting and searching (`sort.c`)
+
+`asm_qsort`/`asm_qsort_r` and `asm_bsearch`/`asm_bsearch_r` are libc-compatible
+(including the GNU `qsort_r`/`bsearch_r` comparison signature). `qsort` is an
+introsort — median-of-three quicksort with an insertion-sort cutoff and a
+heapsort fallback — so it is O(n log n) worst case, moves elements as raw bytes
+(any element type), and is available on all backends.
+
+```c
+int cmp(const void *a, const void *b) {
+    return (*(const int *)a > *(const int *)b) - (*(const int *)a < *(const int *)b);
+}
+int a[100]; size_t n = sizeof a / sizeof a[0];
+asm_qsort(a, n, sizeof a[0], cmp);
+int key = 42, *hit = asm_bsearch(&key, a, n, sizeof a[0], cmp);
 ```
 
 ### Scanning (`scan.asm`)
@@ -451,7 +487,11 @@ resulting module can be linked anywhere that expects `sin`, `log`, `pow`, ….
 All routines take and return IEEE-754 binary64. Results are **faithful**: every
 routine is within 1 ulp of the true result, except `sinh`, `tanh` and `erfc`,
 which reach 2 ulp in narrow bands (the bounds musl documents for its fast
-formulas); `fma` is correctly rounded. Special values follow IEEE-754 (NaN
+formulas), and `tgamma`, which is within 1 ulp for positive arguments and a few
+ulp for negative ones. `fma` is correctly rounded, and `tgamma` evaluates its
+Lanczos series and exponential in **double-double** (≈106-bit) arithmetic —
+including the Lanczos coefficients themselves — so it no longer inherits the
+~8 ulp error of the plain-double musl port. Special values follow IEEE-754 (NaN
 propagates, infinities and signed zero behave as `<math.h>` requires; no
 function sets `errno`). `rint` and `nearbyint` always round to nearest-even
 because the library never touches the floating-point environment — the only

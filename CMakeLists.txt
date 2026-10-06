@@ -102,6 +102,19 @@ target_include_directories(asmlib_scalar_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DI
 target_compile_options(asmlib_scalar_objs PRIVATE ${ASMLIB_LIBC_CFLAGS})
 set_target_properties(asmlib_scalar_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Shared portable C engine linked into the native libraries: the full printf
+# family (src/libc/printf.c), qsort/bsearch (src/libc/sort.c) and the fd output
+# layer (src/dprintf.c). Kept separate from the scalar objects so the hand-written
+# integer formatters in the assembly backends are not shadowed.
+add_library(asmlib_engine OBJECT
+    src/libc/printf.c
+    src/libc/sort.c
+    src/dprintf.c)
+target_include_directories(asmlib_engine PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src/libc")
+target_compile_options(asmlib_engine PRIVATE ${ASMLIB_LIBC_CFLAGS})
+set_target_properties(asmlib_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ---- architecture backend ----------------------------------------------------
 set(ASMLIB_EXTRA_ITEMS "")     # arch-specific objects for the main library
 set(ASMLIB_COMMON_ASM "")      # arena/ctype/cpu, shared with the scalar archive
@@ -170,6 +183,7 @@ endif()
 set(ASMLIB_MAIN_ITEMS
     $<TARGET_OBJECTS:asmlib_version>
     $<TARGET_OBJECTS:asmlib_math>
+    $<TARGET_OBJECTS:asmlib_engine>
     ${ASMLIB_COMMON_ASM}
     ${ASMLIB_EXTRA_ITEMS})
 

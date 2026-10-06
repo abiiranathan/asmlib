@@ -25,6 +25,10 @@ CORE_ASM  := $(filter-out $(addprefix src/,$(addsuffix .asm,$(HOT))),$(SRC_ASM))
 OBJ       := $(patsubst src/%.asm,$(BUILD)/%.o,$(CORE_ASM))
 AVX2_OBJ  := $(addprefix $(BUILD)/avx2/,$(addsuffix .o,$(HOT)))
 SCALAR_HOT_OBJ := $(BUILD)/scalar_hot/mem.o $(BUILD)/scalar_hot/str.o
+# Portable C engine objects linked into the native libraries: the full printf
+# family (src/libc/printf.c), qsort/bsearch (src/libc/sort.c) and the fd output
+# layer (src/dprintf.c).
+NATIVE_C_OBJ := $(BUILD)/printf.o $(BUILD)/sort.o $(BUILD)/dprintf.o
 # Hosted Linux x86-64 resolves the hot routines with ELF IFUNC (no per-call
 # cost); every other host uses the portable branch dispatcher.
 HOST_IFUNC := $(if $(filter Linux,$(shell uname -s)),$(if $(filter x86_64 amd64,$(shell uname -m)),1,),0)
@@ -34,7 +38,7 @@ else
 DISPATCH_OBJ   := $(BUILD)/dispatch.o
 endif
 VERSION_OBJ    := $(BUILD)/version.o
-LIB_OBJ   := $(OBJ) $(AVX2_OBJ) $(SCALAR_HOT_OBJ) $(DISPATCH_OBJ) $(VERSION_OBJ)
+LIB_OBJ   := $(OBJ) $(AVX2_OBJ) $(SCALAR_HOT_OBJ) $(DISPATCH_OBJ) $(VERSION_OBJ) $(NATIVE_C_OBJ)
 HEADER    := include/asmlib.h
 INC       := src/common.inc
 
@@ -46,6 +50,7 @@ A64_AR    ?= aarch64-linux-gnu-ar
 A64_QEMU  ?= qemu-aarch64-static
 A64_SRC   := $(wildcard src/aarch64/*.S)
 A64_OBJ   := $(patsubst src/aarch64/%.S,$(BUILD)/aarch64/%.o,$(A64_SRC))
+A64_C_OBJ := $(BUILD)/aarch64/printf.o $(BUILD)/aarch64/sort.o $(BUILD)/aarch64/dprintf.o
 A64_STATIC:= $(BUILD)/aarch64/libasmlib.a
 A64_CFLAGS?= -O2 -Wall -Wextra -Iinclude -Isrc/aarch64 -static
 
@@ -65,7 +70,7 @@ WASM_CC     ?= clang --target=wasm32-unknown-unknown
 LIBC_SRC      := $(wildcard src/libc/*.c)
 LIBC_CFLAGS   := -O2 -std=c11 -ffreestanding -fno-builtin -fno-stack-protector \
                  -Wall -Wextra -Isrc/libc
-LIBC_TEST_BIN := $(BUILD)/test_portable $(BUILD)/test_portable_alloc $(BUILD)/test_portable_format $(BUILD)/test_portable_scan $(BUILD)/test_portable_alloc_debug
+LIBC_TEST_BIN := $(BUILD)/test_portable $(BUILD)/test_portable_alloc $(BUILD)/test_portable_format $(BUILD)/test_portable_scan $(BUILD)/test_portable_alloc_debug $(BUILD)/test_portable_sort
 
 TEST_BIN      := $(BUILD)/test_asmlib
 TEST_ARENA_BIN:= $(BUILD)/test_arena
@@ -73,6 +78,7 @@ TEST_ALLOC_BIN:= $(BUILD)/test_alloc
 TEST_FORMAT_BIN := $(BUILD)/test_format
 TEST_SCAN_BIN   := $(BUILD)/test_scan
 TEST_LINALG_BIN := $(BUILD)/test_linalg
+TEST_SORT_BIN   := $(BUILD)/test_sort
 TEST_THREADS_BIN:= $(BUILD)/test_alloc_threads
 TEST_ALLOC_DBG_BIN := $(BUILD)/test_alloc_debug
 TEST_MT_BIN   := $(BUILD)/test_alloc_mt $(BUILD)/test_portable_alloc_mt
@@ -123,6 +129,16 @@ $(BUILD)/dispatch_ifunc.o: src/dispatch_ifunc.c | $(BUILD)
 
 $(BUILD)/version.o: src/version.c include/asmlib_version.h | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
+
+# Shared portable C engine linked into the native libraries.
+$(BUILD)/printf.o: src/libc/printf.c src/libc/portable.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD)/sort.o: src/libc/sort.c src/libc/portable.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -fPIC -c -o $@ $<
+
+$(BUILD)/dprintf.o: src/dprintf.c | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -fPIC -c -o $@ $<
 
 # ---- scalar x86-64 fallback library -----------------------------------------
 # The portable C backend compiled natively without SSE4.1/FMA and exported under
@@ -179,6 +195,9 @@ $(TEST_SCAN_BIN): tests/test_scan.c $(STATIC) $(BUILD)/scan_ref.o $(HEADER)
 $(TEST_LINALG_BIN): tests/test_linalg.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ tests/test_linalg.c $(STATIC) -lm $(LDFLAGS)
 
+$(TEST_SORT_BIN): tests/test_sort.c $(STATIC) $(HEADER)
+	$(CC) $(CFLAGS) -o $@ tests/test_sort.c $(STATIC) $(LDFLAGS)
+
 $(TEST_THREADS_BIN): tests/test_alloc_threads.c $(STATIC) $(HEADER)
 	$(CC) $(CFLAGS) -pthread -o $@ tests/test_alloc_threads.c $(STATIC) $(LDFLAGS)
 
@@ -214,13 +233,14 @@ $(BUILD)/test_alloc_mt: tests/test_alloc_mt.c $(STATIC) $(HEADER)
 $(BUILD)/test_portable_alloc_mt: tests/test_portable_alloc_mt.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -pthread -o $@ tests/test_portable_alloc_mt.c src/libc/alloc.c
 
-test: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN) $(TEST_FORMAT_BIN) $(TEST_SCAN_BIN) $(TEST_LINALG_BIN) $(TEST_THREADS_BIN) $(TEST_ALLOC_DBG_BIN) $(TEST_MT_BIN) $(BUILD)/test_freestanding
+test: $(TEST_BIN) $(TEST_ARENA_BIN) $(TEST_ALLOC_BIN) $(TEST_FORMAT_BIN) $(TEST_SCAN_BIN) $(TEST_LINALG_BIN) $(TEST_SORT_BIN) $(TEST_THREADS_BIN) $(TEST_ALLOC_DBG_BIN) $(TEST_MT_BIN) $(BUILD)/test_freestanding
 	./$(TEST_BIN)
 	./$(TEST_ARENA_BIN)
 	./$(TEST_ALLOC_BIN)
 	./$(TEST_FORMAT_BIN)
 	./$(TEST_SCAN_BIN)
 	./$(TEST_LINALG_BIN)
+	./$(TEST_SORT_BIN)
 	./$(TEST_THREADS_BIN)
 	./$(TEST_ALLOC_DBG_BIN)
 	./$(BUILD)/test_freestanding
@@ -332,8 +352,11 @@ $(BUILD)/test_portable: tests/test_portable.c src/libc/mem.c src/libc/str.c src/
 $(BUILD)/test_portable_alloc: tests/test_portable_alloc.c src/libc/alloc.c src/libc/portable.h | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -o $@ tests/test_portable_alloc.c src/libc/alloc.c
 
-$(BUILD)/test_portable_format: tests/test_format.c src/libc/format.c src/libc/portable.h include/asmlib.h | $(BUILD)
-	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_format.c src/libc/format.c
+$(BUILD)/test_portable_format: tests/test_format.c src/libc/format.c src/libc/printf.c src/libc/alloc.c src/libc/portable.h include/asmlib.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -Iinclude -DASMLIB_OS_HEAP=0 -o $@ tests/test_format.c src/libc/format.c src/libc/printf.c src/libc/alloc.c
+
+$(BUILD)/test_portable_sort: tests/test_sort.c src/libc/sort.c src/libc/portable.h include/asmlib.h | $(BUILD)
+	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_sort.c src/libc/sort.c
 
 $(BUILD)/test_portable_scan: tests/test_scan.c src/libc/scan.c src/libc/portable.h include/asmlib.h $(BUILD)/scan_ref.o | $(BUILD)
 	$(CC) $(LIBC_CFLAGS) -Iinclude -o $@ tests/test_scan.c src/libc/scan.c $(BUILD)/scan_ref.o
@@ -440,7 +463,19 @@ $(BUILD)/aarch64/%.o: src/aarch64/%.S src/aarch64/common_aarch64.inc | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(A64_CC) -c -Isrc/aarch64 -o $@ $<
 
-$(A64_STATIC): $(A64_OBJ)
+$(BUILD)/aarch64/printf.o: src/libc/printf.c src/libc/portable.h | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(A64_CC) $(LIBC_CFLAGS) -Isrc/libc -c -o $@ $<
+
+$(BUILD)/aarch64/sort.o: src/libc/sort.c src/libc/portable.h | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(A64_CC) $(LIBC_CFLAGS) -Isrc/libc -c -o $@ $<
+
+$(BUILD)/aarch64/dprintf.o: src/dprintf.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(A64_CC) $(LIBC_CFLAGS) -c -o $@ $<
+
+$(A64_STATIC): $(A64_OBJ) $(A64_C_OBJ)
 	$(A64_AR) rcs $@ $^
 
 # Freestanding math for the AArch64 linalg test (the vector/matrix headers call
@@ -474,6 +509,9 @@ $(BUILD)/aarch64_test_scan: tests/test_scan.c $(A64_STATIC) $(BUILD)/aarch64/sca
 $(BUILD)/aarch64_test_linalg: tests/test_linalg.c $(A64_STATIC) $(A64_MATH_OBJ) $(HEADER) | $(BUILD)
 	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_linalg.c $(A64_STATIC) $(A64_MATH_OBJ) -lm
 
+$(BUILD)/aarch64_test_sort: tests/test_sort.c $(A64_STATIC) $(HEADER) | $(BUILD)
+	$(A64_CC) $(A64_CFLAGS) -o $@ tests/test_sort.c $(A64_STATIC)
+
 $(BUILD)/aarch64_test_threads: tests/test_alloc_threads.c $(A64_STATIC) $(HEADER) | $(BUILD)
 	$(A64_CC) $(A64_CFLAGS) -pthread -o $@ tests/test_alloc_threads.c $(A64_STATIC)
 
@@ -484,13 +522,14 @@ $(BUILD)/aarch64_test_freestanding: tests/test_freestanding.c $(A64_STATIC) $(A6
 aarch64: $(A64_STATIC)
 	@echo "built $(A64_STATIC)"
 
-test-aarch64: aarch64 $(BUILD)/aarch64_test_asmlib $(BUILD)/aarch64_test_arena $(BUILD)/aarch64_test_alloc $(BUILD)/aarch64_test_format $(BUILD)/aarch64_test_scan $(BUILD)/aarch64_test_linalg $(BUILD)/aarch64_test_threads $(BUILD)/aarch64_test_freestanding
+test-aarch64: aarch64 $(BUILD)/aarch64_test_asmlib $(BUILD)/aarch64_test_arena $(BUILD)/aarch64_test_alloc $(BUILD)/aarch64_test_format $(BUILD)/aarch64_test_scan $(BUILD)/aarch64_test_linalg $(BUILD)/aarch64_test_sort $(BUILD)/aarch64_test_threads $(BUILD)/aarch64_test_freestanding
 	$(A64_QEMU) $(BUILD)/aarch64_test_asmlib
 	$(A64_QEMU) $(BUILD)/aarch64_test_arena
 	$(A64_QEMU) $(BUILD)/aarch64_test_alloc
 	$(A64_QEMU) $(BUILD)/aarch64_test_format
 	$(A64_QEMU) $(BUILD)/aarch64_test_scan
 	$(A64_QEMU) $(BUILD)/aarch64_test_linalg
+	$(A64_QEMU) $(BUILD)/aarch64_test_sort
 	$(A64_QEMU) $(BUILD)/aarch64_test_threads
 	$(A64_QEMU) $(BUILD)/aarch64_test_freestanding
 

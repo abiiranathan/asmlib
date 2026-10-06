@@ -18,6 +18,7 @@
 #define ASMLIB_PORTABLE_H
 
 #include <stddef.h>
+#include <stdarg.h>
 
 #ifdef ASMLIB_LIBC_STD_NAMES
 #define ASM_LIBC(name) name
@@ -77,14 +78,30 @@ int    ASM_LIBC(posix_memalign)(void **memptr, size_t alignment, size_t size);
 void  *ASM_LIBC(aligned_alloc)(size_t alignment, size_t size);
 
 /* ---- formatting -------------------------------------------------------- */
-/* Bounded integer-to-string converters (always asm_-prefixed) and the minimal
- * snprintf. See include/asmlib.h for the supported format subset. */
+/* Bounded integer-to-string converters (always asm_-prefixed) and the full
+ * C99 printf family. See include/asmlib.h for the supported format surface. */
 size_t asm_u64toa(unsigned long long value, char *buf, size_t cap);
 size_t asm_i64toa(long long value, char *buf, size_t cap);
 size_t asm_u64toa_base(unsigned long long value, char *buf, size_t cap, unsigned base);
 size_t asm_u64tohex(unsigned long long value, char *buf, size_t cap, int uppercase);
+
 int    ASM_LIBC(snprintf)(char *dst, size_t size, const char *fmt, ...);
+int    ASM_LIBC(vsnprintf)(char *dst, size_t size, const char *fmt, va_list ap);
+int    ASM_LIBC(sprintf)(char *dst, const char *fmt, ...);
+int    ASM_LIBC(vsprintf)(char *dst, const char *fmt, va_list ap);
+int    ASM_LIBC(asprintf)(char **strp, const char *fmt, ...);
+int    ASM_LIBC(vasprintf)(char **strp, const char *fmt, va_list ap);
 int    ASM_LIBC(sscanf)(const char *src, const char *fmt, ...);
+
+/* ---- algorithms -------------------------------------------------------- */
+void  ASM_LIBC(qsort)(void *base, size_t nmemb, size_t size,
+                      int (*compar)(const void *, const void *));
+void  ASM_LIBC(qsort_r)(void *base, size_t nmemb, size_t size,
+                        int (*compar)(const void *, const void *, void *), void *arg);
+void *ASM_LIBC(bsearch)(const void *key, const void *base, size_t nmemb, size_t size,
+                        int (*compar)(const void *, const void *));
+void *ASM_LIBC(bsearch_r)(const void *key, const void *base, size_t nmemb, size_t size,
+                          int (*compar)(const void *, const void *, void *), void *arg);
 
 /* No-op on the portable backend (no per-thread cache). */
 size_t ASM_LIBC(alloc_flush_tcache)(void);

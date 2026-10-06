@@ -36,6 +36,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #include "asmlib_version.h"
 
@@ -305,36 +306,64 @@ size_t asm_u64tohex(uint64_t value, char* buf, size_t cap, int uppercase);
 
 /** @} */
 
-/** @defgroup asm_snprintf Minimal snprintf (format.asm)
- *  `int asm_snprintf(char* dst, size_t size, const char* fmt, ...)`
- *
- *  A small, fast, freestanding replacement for the common integer/string cases
- *  of snprintf. Semantics match C99 snprintf: at most `size - 1` bytes are
- *  written, a NUL is stored when `size > 0`, and the return value is the number
- *  of bytes that *would* have been written excluding the NUL (negative is never
- *  returned). Not floating point, not locale aware, not async-signal-safe.
+/** @defgroup asm_snprintf Formatted output (format.asm / src/libc)
+ *  A complete, freestanding C99 printf family. Semantics match C99 snprintf:
+ *  at most `size - 1` bytes are written, a NUL is stored when `size > 0`, and
+ *  the return value is the number of bytes that *would* have been written
+ *  excluding the NUL (negative is never returned). Not locale aware and not
+ *  async-signal-safe.
  *
  *  Supported conversions (an argument is consumed for each):
  *  | Spec | Meaning |
  *  | ---- | ------- |
  *  | `%%` | literal percent |
  *  | `%c` | int -> one byte |
- *  | `%s` | `char*` (`NULL` -> `"(null)"`) |
- *  | `%p` | `void*` -> `"0x"` + lowercase hex (`NULL` -> `"(nil)"`) |
- *  | `%d` `%i` | signed decimal (int, or int64 with an `l`/`ll` modifier) |
- *  | `%u` | unsigned decimal |
- *  | `%x` `%X` | hexadecimal (lower/upper) |
- *  | `%o` | octal |
+ *  | `%s` | `char*` (`NULL` -> `"(null)"`), precision bounds the length |
+ *  | `%p` | `void*` -> `"0x"` + hex (`NULL` -> `"(nil)"`) |
+ *  | `%d` `%i` | signed decimal |
+ *  | `%u` `%o` `%x` `%X` | unsigned, octal, hex (lower/upper) |
+ *  | `%f` `%F` `%e` `%E` `%g` `%G` `%a` `%A` | floating point |
+ *  | `%n` | store the count written so far |
  *
- *  Flags: `-` left-justify, `0` zero-pad (numeric conversions; ignored for
- *  `%s`/`%c` and with `-`). Width: decimal digits only, no `*`. Length: `l` and
- *  `ll` both mean 64-bit for `d`/`i`/`u`/`x`/`X`/`o`; no `h`/`z`/`j`/`t`/`L`.
- *  Anything else after `%` (including precision `.`, `*`, and
- *  `%f`/`%e`/`%g`/`%a`/`%n`) is copied through literally as `%` plus that
- *  character and consumes no argument. Widths above `2^31 - 1` are clamped.
- *  @{ */
+ *  Flags: `-` left-justify, `+` force sign, space sign, `#` alternate form,
+ *  `0` zero-pad. Width and precision may be a decimal or `*`. Length modifiers:
+ *  `hh`, `h`, `l`, `ll`, `z`, `j`, `t` for integers, and `L` for `long double`
+ *  (narrowed to `double`; values needing extended precision are not exact).
+ *  Floating point is correctly rounded (round half to even) with the exact
+ *  decimal expansion of the binary value. @{ */
 
+/** @brief Bounded formatted output; see the group contract. */
 int asm_snprintf(char* dst, size_t size, const char* fmt, ...);
+
+/** @brief `va_list` form of asm_snprintf(). */
+int asm_vsnprintf(char* dst, size_t size, const char* fmt, va_list ap);
+
+/** @brief Unbounded formatted output into `dst` (caller guarantees room). */
+int asm_sprintf(char* dst, const char* fmt, ...);
+
+/** @brief `va_list` form of asm_sprintf(). */
+int asm_vsprintf(char* dst, const char* fmt, va_list ap);
+
+/** @brief Allocate and format; `*strp` receives a malloc'd NUL-terminated
+ *         string (release with asm_free). Returns the length or -1. */
+int asm_asprintf(char** strp, const char* fmt, ...);
+
+/** @brief `va_list` form of asm_asprintf(). */
+int asm_vasprintf(char** strp, const char* fmt, va_list ap);
+
+#if ASMLIB_OS_HEAP
+/** @brief Formatted output to a file descriptor (Linux; raw write syscall). */
+int asm_dprintf(int fd, const char* fmt, ...);
+
+/** @brief `va_list` form of asm_dprintf(). */
+int asm_vdprintf(int fd, const char* fmt, va_list ap);
+
+/** @brief Formatted output to standard output (fd 1). */
+int asm_printf(const char* fmt, ...);
+
+/** @brief `va_list` form of asm_printf(). */
+int asm_vprintf(const char* fmt, va_list ap);
+#endif
 
 /** @} */
 
@@ -528,6 +557,32 @@ size_t asm_alloc_flush_tcache(void);
 
 /** @} */
 
+/** @defgroup asm_algo Sorting and searching (sort.asm / src/libc)
+ *  libc-compatible `qsort`/`bsearch`. Elements are moved as raw bytes, so any
+ *  element type works; the comparison function follows the libc contract.
+ *  qsort is an introsort (median-of-three quicksort with an insertion-sort
+ *  cutoff and a heapsort fallback), so it is O(n log n) worst case.
+ *  @{ */
+
+/** @brief Sort `nmemb` elements of `size` bytes each. */
+void asm_qsort(void* base, size_t nmemb, size_t size,
+               int (*compar)(const void*, const void*));
+
+/** @brief Reentrant qsort (GNU signature: `compar(a, b, arg)`). */
+void asm_qsort_r(void* base, size_t nmemb, size_t size,
+                 int (*compar)(const void*, const void*, void*), void* arg);
+
+/** @brief Binary search a sorted array.
+ *  @return A pointer to a matching element, or `NULL`. */
+void* asm_bsearch(const void* key, const void* base, size_t nmemb, size_t size,
+                  int (*compar)(const void*, const void*));
+
+/** @brief Reentrant bsearch (GNU signature: `compar(key, elem, arg)`). */
+void* asm_bsearch_r(const void* key, const void* base, size_t nmemb, size_t size,
+                    int (*compar)(const void*, const void*, void*), void* arg);
+
+/** @} */
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
@@ -585,6 +640,22 @@ size_t asm_alloc_flush_tcache(void);
 #define malloc_usable_size asm_malloc_usable_size
 #define posix_memalign     asm_posix_memalign
 #define aligned_alloc      asm_aligned_alloc
+#define sprintf            asm_sprintf
+#define snprintf           asm_snprintf
+#define vsprintf           asm_vsprintf
+#define vsnprintf          asm_vsnprintf
+#define asprintf           asm_asprintf
+#define vasprintf          asm_vasprintf
+#if ASMLIB_OS_HEAP
+#define printf             asm_printf
+#define vprintf            asm_vprintf
+#define dprintf            asm_dprintf
+#define vdprintf           asm_vdprintf
+#endif
+#define qsort              asm_qsort
+#define qsort_r            asm_qsort_r
+#define bsearch            asm_bsearch
+#define bsearch_r          asm_bsearch_r
 #endif /* ASMLIB_ENABLE_LIBC_ALIASES */
 /** @} */
 

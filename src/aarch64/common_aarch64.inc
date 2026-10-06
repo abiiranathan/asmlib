@@ -31,6 +31,7 @@
 /* Linux aarch64 syscall numbers. */
 #define SYS_mmap   222
 #define SYS_munmap 215
+#define SYS_write  64                /* write(fd, buf, count)             */
 #define PROT_RW    3                 /* PROT_READ | PROT_WRITE            */
 #define MAP_ANON_PRIV 0x22           /* MAP_PRIVATE | MAP_ANONYMOUS       */
 #define ERR_LIMIT  (-4095)           /* [-4095,-1] encodes -errno         */

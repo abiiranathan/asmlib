@@ -12,7 +12,10 @@
  * tgamma/lgamma are compared with a combined criterion: at most 3 ulp, or an
  * error of at most 1e-14 relative to max(1, |want|) (the two libms use
  * different but equally accurate algorithms, and lgamma crosses zero, where a
- * pure relative measure is meaningless).
+ * pure relative measure is meaningless). tgamma evaluates its Lanczos series
+ * and exponential in double-double arithmetic, so it is within ~1 ulp for
+ * positive arguments (a few ulp for negative ones via reflection); lgamma is
+ * at most a few ulp including near its poles.
  *============================================================================*/
 
 #include "math_test.h"
@@ -62,6 +65,8 @@ static MT_UNUSED double mt_maxrelx;
 static MT_UNUSED uint64_t mt_gmaxulp;
 static MT_UNUSED const char *mt_gmaxfn = "-";
 static MT_UNUSED double mt_gmaxx;
+static MT_UNUSED uint64_t mt_tmaxulp, mt_lmaxulp;
+static MT_UNUSED double mt_tmaxx, mt_lmaxx;
 
 /* Compare two gamma-function magnitudes: exact for NaN/Inf/zero, otherwise
  * within 3 ulp or 1e-14 relative to max(1, |want|). Normalizing by the larger
@@ -103,6 +108,13 @@ static MT_UNUSED void gamma_cmp(const char *what, double x, double got,
             mt_gmaxulp = u;
             mt_gmaxfn = what;
             mt_gmaxx = x;
+        }
+        if (mag >= 1.0L) {
+            if (what[0] == 't') {
+                if (u > mt_tmaxulp) { mt_tmaxulp = u; mt_tmaxx = x; }
+            } else {
+                if (u > mt_lmaxulp) { mt_lmaxulp = u; mt_lmaxx = x; }
+            }
         }
         ok = (u <= 3) || (rel <= 1e-14L);
         if (mag < 1.0L && u > 3)
@@ -252,5 +264,8 @@ int main(void)
            mt_maxrel, mt_maxrelfn, mt_maxrelx);
     printf("   gamma max ulp (|result| >= 1)    %llu (%s at %.17g)\n",
            (unsigned long long)mt_gmaxulp, mt_gmaxfn, mt_gmaxx);
+    printf("   tgamma max ulp %llu (at %.17g) | lgamma max ulp %llu (at %.17g)\n",
+           (unsigned long long)mt_tmaxulp, mt_tmaxx,
+           (unsigned long long)mt_lmaxulp, mt_lmaxx);
     MT_RESULT("special");
 }

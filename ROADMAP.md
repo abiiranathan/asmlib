@@ -84,3 +84,22 @@ value/effort. Status: `[ ]` todo · `[~]` in progress · `[x]` done.
       comments, and the README is the generated front page.
 - [x] `docs/BENCHMARKS.md`: methodology (clocks, iteration counts, best-of-N,
       builtin substitution, environment) and the published results.
+
+## Phase 7 — I/O, algorithms and format parity
+- [x] Full C99 printf family in the shared C engine (`src/libc/printf.c`),
+      linked into every backend: `snprintf`/`vsnprintf`, `sprintf`/`vsprintf`,
+      `asprintf`/`vasprintf` and (native) `dprintf`/`printf` over the raw
+      `write(2)` syscall (`asm_sys_write`).
+- [x] Correctly-rounded floating-point formatting (`%f`/`%e`/`%g`/`%a`, upper
+      forms) using an exact big-integer decimal conversion, round half to even;
+      plus the full flag set, `*` width/precision, `hh h l ll z j t L` length
+      modifiers and `%n`. `asm_snprintf` is no longer a bounded integer subset.
+- [x] `qsort`/`qsort_r` and `bsearch`/`bsearch_r` (`src/libc/sort.c`), an
+      introsort available on all backends.
+- [x] Differential float/`*`/`%n`/`dprintf` format tests and a new sort suite,
+      run on x86-64, AArch64 and the portable backend.
+- [ ] (later) Hand-written assembly versions of the printf engine / introsort
+      for x86-64 and AArch64, to move them off the shared C path.
+- [ ] (later) `%m` (strerror), locale-aware grouping, and exact `long double`
+      formatting on targets where `long double` is binary128.
+

@@ -4,6 +4,35 @@ All notable changes to asmlib. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) for the public API.
 
+## [Unreleased]
+
+### Added
+- Full C99 `printf` family in the freestanding C engine (`src/libc/printf.c`),
+  linked into every backend: `snprintf`/`vsnprintf`, `sprintf`/`vsprintf`,
+  `asprintf`/`vasprintf`, and (native, via a raw `write` syscall) `dprintf`/
+  `vdprintf`, `printf`/`vprintf`. Supports `%f`/`%e`/`%g`/`%a` (and upper-case
+  forms) with **correctly rounded** output (round half to even, exact decimal
+  expansion), the full flag set (`-+ #0`), `*` width/precision, and the `hh h l
+  ll z j t L` length modifiers, plus `%n`. `asm_snprintf` is now fully
+  C99-compliant instead of a bounded integer subset.
+- `qsort`/`qsort_r` and `bsearch`/`bsearch_r` (`src/libc/sort.c`), an introsort
+  with an insertion-sort cutoff and a heapsort fallback, available on all
+  backends.
+- `asm_sys_write` (raw `write(2)`) on x86-64 and AArch64.
+- A differential `tests/test_sort.c` and an expanded `tests/test_format.c`
+  (floating point, precision, `*`, `%n`, `dprintf`) run on x86-64, AArch64 and
+  the portable backend.
+- `tgamma` now evaluates its Lanczos series and exponential in double-double
+  arithmetic (including the coefficients): positive arguments are within 1 ulp
+  (previously up to 8 ulp); negative arguments via reflection are within a few
+  ulp. Works freestanding on x86-64, AArch64 and wasm32 (FMA when available,
+  Dekker splitting otherwise).
+
+### Changed
+- The hand-written `asm_snprintf` was removed from `src/format.asm` and
+  `src/aarch64/format.S`; the assembly backends keep the fast bounded integer
+  formatters and share the portable C printf engine for full compliance.
+
 ## [1.0.0] - 2026-09-28
 
 First release. One C header (`asmlib.h`) and one library for x86-64, AArch64,

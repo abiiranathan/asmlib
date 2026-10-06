@@ -149,16 +149,58 @@ static void test_snprintf_pointer(void) {
 }
 
 static void test_snprintf_unsupported(void) {
-    /* Unsupported conversions are copied literally and consume no argument. */
+    /* Genuinely unknown conversions are copied literally, no argument. */
     char b[64];
-    int     r = asm_snprintf(b, sizeof b, "a%fb%nc", 1.0);
-    CHECK(r == 7 && strcmp(b, "a%fb%nc") == 0, "unsupported passthrough");
-    r = asm_snprintf(b, sizeof b, "%.3s", "hello");
-    CHECK(r == 4 && strcmp(b, "%.3s") == 0, "precision passthrough");
-    r = asm_snprintf(b, sizeof b, "%*d", 5, 42);
-    CHECK(r == 3 && strcmp(b, "%*d") == 0, "star passthrough");
-    r = asm_snprintf(b, sizeof b, "%q");
+    int r = asm_snprintf(b, sizeof b, "%q");
     CHECK(r == 2 && strcmp(b, "%q") == 0, "unknown passthrough");
+    r = asm_snprintf(b, sizeof b, "a%yb");
+    CHECK(r == 4 && strcmp(b, "a%yb") == 0, "unknown passthrough 2");
+}
+
+/* Floating point: every supported conversion is compared byte-for-byte against
+ * the host snprintf, over a table of special/awkward values and random bit
+ * patterns. */
+static int f_is_special(double v) {
+    union { double d; uint64_t u; } x;
+    x.d = v;
+    return ((x.u >> 52) & 0x7ff) == 0x7ff;
+}
+
+static uint64_t f_rng = 0x243F6A8885A308D3ULL;
+static double f_rnd(void) {
+    union { uint64_t u; double d; } x;
+    f_rng ^= f_rng << 13; f_rng ^= f_rng >> 7; f_rng ^= f_rng << 17;
+    x.u = (f_rng << 1) | (f_rng & 1);
+    return x.d;
+}
+
+static void test_snprintf_floats(void) {
+    static const double vals[] = {
+        0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 3.14159265358979, -2.718281828459045,
+        123456.789, 1e-7, 1e7, 1e-300, 1e300, 0.0001234, 999999.5,
+        0.1, 0.2, 0.3, 2.0 / 3.0, 1e20, -1e20, 5e-324,
+        1.7976931348623157e308, 2.2250738585072014e-308, 100.0, 1234.5678,
+        1.0 / 7.0, 6.02214076e23, 0.0001, 0.00001,
+    };
+    static const char *fmts[] = {
+        "%f", "%F", "%.0f", "%.1f", "%.2f", "%.10f", "%12.3f", "%-12.3f",
+        "%012.3f", "%+.2f", "% .2f", "%#.0f", "%e", "%E", "%.0e", "%.3e",
+        "%.10e", "%12.3e", "%-12.3e", "%012.3e", "%g", "%G", "%.0g", "%.3g",
+        "%.10g", "%12.5g", "%-12.5g", "%#.5g", "%a", "%A", "%.0a", "%.3a", "%#.0a",
+    };
+    const size_t nv = sizeof vals / sizeof vals[0];
+    const size_t nf = sizeof fmts / sizeof fmts[0];
+    for (size_t v = 0; v < nv; v++)
+        for (size_t f = 0; f < nf; f++) DIFF(192, fmts[f], vals[v]);
+
+    for (int i = 0; i < 5000; i++) {
+        double v = f_rnd();
+        if (f_is_special(v)) continue;
+        DIFF(192, "%.17g", v);
+        DIFF(192, "%.6f", v);
+        DIFF(192, "%.9e", v);
+        DIFF(192, "%a", v);
+    }
 }
 
 /*------------------------------------------------------------------------------
@@ -308,6 +350,23 @@ static void test_guard(void) {
     munmap(base, (size_t)pg * 2);
 }
 
+#if ASMLIB_OS_HEAP
+static void test_dprintf(void) {
+    char tmpl[] = "/tmp/asmlib_dprintf_XXXXXX";
+    char expect[128], got[160];
+    int fd = mkstemp(tmpl);
+    int r, re, n;
+    if (fd < 0) { CHECK(0, "dprintf mkstemp"); return; }
+    r = asm_dprintf(fd, "n=%d s=%s f=%.3f\n", -7, "hi", 3.14159);
+    re = snprintf(expect, sizeof expect, "n=%d s=%s f=%.3f\n", -7, "hi", 3.14159);
+    lseek(fd, 0, SEEK_SET);
+    n = (int)read(fd, got, sizeof got);
+    CHECK(r == re && n == re && memcmp(got, expect, (size_t)re) == 0, "dprintf");
+    close(fd);
+    unlink(tmpl);
+}
+#endif
+
 int main(void) {
     printf("== asmlib format test suite ==\n");
     test_snprintf_literals();   printf("   literals    done\n");
@@ -315,11 +374,15 @@ int main(void) {
     test_snprintf_widths();     printf("   widths      done\n");
     test_snprintf_strings();    printf("   strings     done\n");
     test_snprintf_pointer();    printf("   pointer     done\n");
-    test_snprintf_unsupported();printf("   unsupported done\n");
+    test_snprintf_unsupported();printf("   unknown     done\n");
+    test_snprintf_floats();     printf("   floats      done\n");
     test_u64toa();              printf("   u64toa      done\n");
     test_i64toa();              printf("   i64toa      done\n");
     test_truncation();          printf("   truncation  done\n");
     test_guard();               printf("   guard       done\n");
+#if ASMLIB_OS_HEAP
+    test_dprintf();             printf("   dprintf     done\n");
+#endif
     printf("== %lu checks, %lu failures ==\n", checks, failures);
     return failures != 0;
 }

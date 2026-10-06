@@ -59,25 +59,6 @@ static double gamma_sinpi(double x)
 
 #define GAMMA_N 12
 static const double gmhalf = 5.524680040776729583740234375;
-static const double Snum[GAMMA_N+1] = {
-	23531376880.410759688572007674451636754734846804940,
-	42919803642.649098768957899047001988850926355848959,
-	35711959237.355668049440185451547166705960488635843,
-	17921034426.037209699919755754458931112671403265390,
-	6039542586.3520280050642916443072979210699388420708,
-	1439720407.3117216736632230727949123939715485786772,
-	248874557.86205415651146038641322942321632125127801,
-	31426415.585400194380614231628318205362874684987640,
-	2876370.6289353724412254090516208496135991145378768,
-	186056.26539522349504029498971604569928220784236328,
-	8071.6720023658162106380029022722506138218516325024,
-	210.82427775157934587250973392071336271166969580291,
-	2.5066282746310002701649081771338373386264310793408,
-};
-static const double Sden[GAMMA_N+1] = {
-	0, 39916800, 120543840, 150917976, 105258076, 45995730, 13339535,
-	2637558, 357423, 32670, 1925, 66, 1,
-};
 /* n! for small integer n */
 static const double fact[] = {
 	1, 1, 2, 6, 24, 120, 720, 5040.0, 40320.0, 362880.0, 3628800.0, 39916800.0,
@@ -86,33 +67,188 @@ static const double fact[] = {
 	2432902008176640000.0, 51090942171709440000.0, 1124000727777607680000.0,
 };
 
-/* S(x) rational function for positive x */
-static double S(double x)
+/*------------------------------------------------------------------------------
+ * Minimal double-double ("two-double") arithmetic.
+ *------------------------------------------------------------------------------
+ * The Lanczos series and its exponential are evaluated in ~106-bit precision so
+ * the final result is faithful to well under 1 ulp; plain double loses several
+ * ulp here. two_sum/two_prod are exact error-free transforms; add/mul/div round
+ * only once at renormalisation.
+ *----------------------------------------------------------------------------*/
+typedef struct { double hi, lo; } gdd;
+
+static gdd g_two_sum(double a, double b)
 {
-	double_t num = 0, den = 0;
+	gdd r;
+	double bb;
+
+	r.hi = a + b;
+	bb = r.hi - a;
+	r.lo = (a - (r.hi - bb)) + (b - bb);
+	return r;
+}
+
+static gdd g_quick_two_sum(double a, double b)
+{
+	gdd r;
+
+	r.hi = a + b;
+	r.lo = b - (r.hi - a);
+	return r;
+}
+
+static gdd g_add(gdd a, gdd b)
+{
+	gdd s;
+
+	s = g_two_sum(a.hi, b.hi);
+	s.lo += a.lo + b.lo;
+	return g_quick_two_sum(s.hi, s.lo);
+}
+
+static gdd g_mul(gdd a, gdd b)
+{
+	gdd p;
+
+	p.hi = a.hi * b.hi;
+#if defined(__FP_FAST_FMA)
+	p.lo = __builtin_fma(a.hi, b.hi, -p.hi);
+#else
+	{
+		const double split = 134217729.0;	/* 2^27 + 1 */
+		double c, abig, ahi, alo, d, bbig, bhi, blo;
+
+		c = split * a.hi; abig = c - a.hi; ahi = c - abig; alo = a.hi - ahi;
+		d = split * b.hi; bbig = d - b.hi; bhi = d - bbig; blo = b.hi - bhi;
+		p.lo = ((ahi * bhi - p.hi) + ahi * blo + alo * bhi) + alo * blo;
+	}
+#endif
+	p.lo += a.hi * b.lo + b.hi * a.lo;
+	return g_quick_two_sum(p.hi, p.lo);
+}
+
+static gdd g_div(gdd a, gdd b)
+{
+	double q1, q2;
+	gdd p, r;
+
+	q1 = a.hi / b.hi;
+	p = g_mul((gdd){q1, 0.0}, b);
+	r = g_add(a, (gdd){-p.hi, -p.lo});
+	q2 = r.hi / b.hi;
+	return g_quick_two_sum(q1, q2);
+}
+
+/* m in [0.5,1), y = m * 2^(*k) (bit manipulation; y > 0) */
+static double g_frexp(double y, int *k)
+{
+	union { double f; uint64_t u; } v = {y};
+	int e = (int)((v.u >> 52) & 0x7ff);
+
+	if (e == 0) {					/* subnormal: scale up first */
+		v.f *= 0x1p54;
+		e = (int)((v.u >> 52) & 0x7ff) - 54;
+	}
+	*k = e - 1022;
+	v.u = (v.u & ~(0x7ffULL << 52)) | (1022ULL << 52);
+	return v.f;
+}
+
+/* log(y) in double-double: reduce to m in [1/sqrt2, sqrt2) and sum the atanh
+ * series log(m) = 2*atanh(s), s = (m-1)/(m+1), with double-double coefficients. */
+static gdd g_log(double y)
+{
+	static const gdd ln2 = { 0.6931471805599453, 2.3190468138462996e-17 };
+	static const gdd inv_odd[24] = {
+		{ 1, 0 },					/* 1/1  */
+		{ 0.33333333333333331, 1.8503717077085941e-17 },	/* 1/3  */
+		{ 0.20000000000000001, -1.1102230246251566e-17 },	/* 1/5  */
+		{ 0.14285714285714285, 7.9301644616082606e-18 },	/* 1/7  */
+		{ 0.1111111111111111, 6.1679056923619804e-18 },	/* 1/9  */
+		{ 0.090909090909090912, -2.5232341468753558e-18 },	/* 1/11 */
+		{ 0.076923076923076927, -4.2700885562506023e-18 },	/* 1/13 */
+		{ 0.066666666666666666, 9.251858538542971e-19 },	/* 1/15 */
+		{ 0.058823529411764705, 8.1634045928320333e-19 },	/* 1/17 */
+		{ 0.052631578947368418, 2.9216395384872539e-18 },	/* 1/19 */
+		{ 0.047619047619047616, 2.6433881538694202e-18 },	/* 1/21 */
+		{ 0.043478260869565216, 1.2067641572012571e-18 },	/* 1/23 */
+		{ 0.040000000000000001, -8.3266726846886737e-19 },	/* 1/25 */
+		{ 0.037037037037037035, 2.0559685641206601e-18 },	/* 1/27 */
+		{ 0.034482758620689655, 4.7854440716601574e-19 },	/* 1/29 */
+		{ 0.032258064516129031, 8.9534114889125525e-19 },	/* 1/31 */
+		{ 0.030303030303030304, -8.4107804895845195e-19 },	/* 1/33 */
+		{ 0.028571428571428571, 8.9214350193092927e-19 },	/* 1/35 */
+		{ 0.027027027027027029, -1.50030138462859e-18 },	/* 1/37 */
+		{ 0.02564102564102564, 8.8960178255220869e-19 },	/* 1/39 */
+		{ 0.024390243902439025, -8.4620657364722295e-19 },	/* 1/41 */
+		{ 0.023255813953488372, 3.2273925134452225e-19 },	/* 1/43 */
+		{ 0.022222222222222223, -8.4808703269977233e-19 },	/* 1/45 */
+		{ 0.021276595744680851, 5.1672614178032549e-19 },	/* 1/47 */
+	};
+	gdd s, z, p;
+	int k, n;
+	double m;
+
+	m = g_frexp(y, &k);
+	if (m < 0.70710678118654752440) { m *= 2.0; k--; }
+	s = g_div(g_two_sum(m, -1.0), g_two_sum(m, 1.0));
+	z = g_mul(s, s);
+	p = (gdd){0.0, 0.0};
+	for (n = 24; n >= 1; n--)
+		p = g_add(g_mul(p, z), inv_odd[n - 1]);
+	return g_add(g_mul((gdd){(double)k, 0.0}, ln2),
+	             g_mul(g_mul((gdd){2.0, 0.0}, s), p));
+}
+
+/* Lanczos coefficients at double-double precision (the double literals in a
+ * plain double port carry only ~17 of the ~50 available digits, which is the
+ * dominant error there). */
+static const gdd Snum[GAMMA_N+1] = {
+	{ 23531376880.410759, 7.1640403892445162e-07 },
+	{ 42919803642.649101, -2.488366319702998e-06 },
+	{ 35711959237.355667, 9.3518237295154714e-07 },
+	{ 17921034426.037209, 1.142790849504459e-06 },
+	{ 6039542586.3520279, 1.119978853943073e-07 },
+	{ 1439720407.3117216, 1.1032398967435741e-07 },
+	{ 248874557.86205417, -1.2666548646789895e-08 },
+	{ 31426415.585400194, 4.5094199041738073e-10 },
+	{ 2876370.6289353725, -1.5682816961562744e-11 },
+	{ 186056.26539522348, 1.1829865440498822e-11 },
+	{ 8071.6720023658163, -8.6604415029284447e-14 },
+	{ 210.82427775157936, -1.3246695303211193e-14 },
+	{ 2.5066282746310002, 2.8552552937793735e-17 },
+};
+static const double Sden[GAMMA_N+1] = {
+	0, 39916800, 120543840, 150917976, 105258076, 45995730, 13339535,
+	2637558, 357423, 32670, 1925, 66, 1,
+};
+
+/* S(x) rational function for positive x, in double-double. */
+static gdd g_S(double x)
+{
+	gdd num = {0.0, 0.0}, den = {0.0, 0.0};
 	int i;
 
-	/* to avoid overflow handle large x differently */
 	if (x < 8)
 		for (i = GAMMA_N; i >= 0; i--) {
-			num = num * x + Snum[i];
-			den = den * x + Sden[i];
+			num = g_add(g_mul(num, (gdd){x, 0.0}), Snum[i]);
+			den = g_add(g_mul(den, (gdd){x, 0.0}), (gdd){Sden[i], 0.0});
 		}
 	else
 		for (i = 0; i <= GAMMA_N; i++) {
-			num = num / x + Snum[i];
-			den = den / x + Sden[i];
+			num = g_add(g_div(num, (gdd){x, 0.0}), Snum[i]);
+			den = g_add(g_div(den, (gdd){x, 0.0}), (gdd){Sden[i], 0.0});
 		}
-	return num/den;
+	return g_div(num, den);
 }
 
 double ASM_MATH(tgamma)(double x)
 {
-	union {double f; uint64_t i;} u = {x};
-	double absx, y;
-	double_t dy, z, r;
+	union { double f; uint64_t i; } u = {x};
+	double absx, e;
 	uint32_t ix = u.i>>32 & 0x7fffffff;
 	int sign = u.i>>63;
+	gdd S, E, r, ydd, z0dd, ly;
 
 	/* special cases */
 	if (ix >= 0x7ff00000)
@@ -146,29 +282,35 @@ double ASM_MATH(tgamma)(double x)
 
 	absx = sign ? -x : x;
 
-	/* handle the error of x + g - 0.5 */
-	y = absx + gmhalf;
-	if (absx > gmhalf) {
-		dy = y - absx;
-		dy -= gmhalf;
-	} else {
-		dy = y - gmhalf;
-		dy -= absx;
+	/* Exact y = absx + g - 0.5 and z0 = absx - 0.5 as double-doubles, so no
+	 * rounding correction is needed later. */
+	ydd = g_two_sum(absx, gmhalf);
+	z0dd = g_two_sum(absx, -0.5);
+	/* log(y) for a two-double y: log(yhi) plus the first-order correction. */
+	ly = g_log(ydd.hi);
+	ly = g_add(ly, g_div((gdd){ydd.lo, 0.0}, (gdd){ydd.hi, 0.0}));
+	S = g_S(absx);
+	/* E = z0*log(y) - y, the exponent of S * y^z0 * exp(-y) */
+	E = g_add(g_mul(z0dd, ly), (gdd){-ydd.hi, -ydd.lo});
+	e = ASM_MATH(exp)(E.hi);
+	if (!(e <= DBL_MAX / S.hi)) {
+		/* S*exp(E) overflowed: for x<0 the reflection drives the result to a
+		 * signed zero, otherwise tgamma overflows to +inf. */
+		if (x < 0) {
+			double rf = -gamma_pi / (gamma_sinpi(absx) * absx);
+			return rf < 0 ? -0.0 : 0.0;
+		}
+		return x + INFINITY;
 	}
-
-	z = absx - 0.5;
-	r = S(absx) * exp(-y);
+	r = g_mul(S, (gdd){e, 0.0});
+	r = g_add(r, g_mul(r, (gdd){E.lo, 0.0}));	/* exp(Ehi)*(1+Elo) */
 	if (x < 0) {
 		/* reflection formula for negative x */
 		/* sinpi(absx) is not 0, integers are already handled */
-		r = -gamma_pi / (gamma_sinpi(absx) * absx * r);
-		dy = -dy;
-		z = -z;
+		gdd sn = g_mul((gdd){gamma_sinpi(absx), 0.0}, (gdd){absx, 0.0});
+		r = g_div(g_div((gdd){-gamma_pi, 0.0}, sn), r);
 	}
-	r += dy * (gmhalf+0.5) * r / y;
-	z = pow(y, 0.5*z);
-	y = r * z * z;
-	return y;
+	return r.hi + r.lo;
 }
 
 /*==============================================================================

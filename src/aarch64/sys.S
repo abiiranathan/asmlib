@@ -77,6 +77,28 @@ asm_sys_munmap:
     .size asm_sys_munmap, .-asm_sys_munmap
 
 /*==============================================================================
+ * long asm_sys_write(int fd, const void *buf, size_t count)
+ *------------------------------------------------------------------------------
+ * Raw write(2) for the formatted-output (dprintf/printf) layer. Returns the
+ * number of bytes written or -errno; callers must handle short writes.
+ *
+ * Parameters (AAPCS64):
+ *   x0 = fd (int)      - file descriptor
+ *   x1 = buf (void *)  - bytes to write
+ *   x2 = count (size_t)- byte count
+ * Returns:
+ *   x0 = bytes written, or -errno
+ *============================================================================*/
+    .globl asm_sys_write
+    .type  asm_sys_write, %function
+    .p2align 2
+asm_sys_write:
+    mov     x8, #SYS_write              /* x8 = 64 (write syscall number)       */
+    svc     #0                          /* x0 = bytes written or -errno         */
+    ret
+    .size asm_sys_write, .-asm_sys_write
+
+/*==============================================================================
  * void *asm_sys_alloc(size_t size, void *ctx)
  *------------------------------------------------------------------------------
  * Arena-compatible allocation callback (ctx is unused).
